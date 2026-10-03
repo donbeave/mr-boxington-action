@@ -67,6 +67,14 @@ smaller because they omit the Cargo registry, which Cargo then downloads again
 inside the build; in paired measurements on GitHub-hosted runners it restored
 and built a small edit roughly ten seconds slower than the `target` payload.
 
+For disposable hosted runners, set `isolate-objects-cache: true` to keep the
+live mbx store under `RUNNER_TEMP` and save only the external exported bundle.
+After a valid bundle is exported, the action removes that isolated store before
+`actions/cache` stages its upload archive. Leave this off on persistent runners
+that rely on mbx's native warm store. Use one isolated objects-cache action
+invocation per job; its stable bundle path keeps the cache version shared across
+jobs and runs.
+
 From mbx 1.12.0 the bundle is a directory instead of a tar. `actions/cache`
 archives whatever path it is given, so a tar meant every byte was written twice
 on restore: once when the cache action unpacked its own archive, and again when
@@ -284,6 +292,7 @@ aliases for `remote-url` and `remote-mode`.
 | `github-token`              | `${{ github.token }}` | Token used when `GITHUB_TOKEN` is not exported                                 |
 | `cache-generation`          | `v1`                  | Generated GitHub cache key generation                                          |
 | `github-cache-mode`         | `target`              | GitHub payload: warm Cargo `target` tree or portable mbx `objects`             |
+| `isolate-objects-cache`     | `false`               | Put GitHub `objects` mode in a private `RUNNER_TEMP` store and save its bundle |
 | `save-on-workflow-dispatch` | `false`               | Save after a successful trusted `workflow_dispatch` run                        |
 | `save-on-pull-request`      | `false`               | Save after a successful same-repository pull request, scoped to it             |
 | `save-on-protected-branch`  | `false`               | Save after a successful push to a protected non-default branch                 |

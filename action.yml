@@ -31,6 +31,9 @@ inputs:
   github-cache-mode:
     description: GitHub cache payload, either the warm Cargo "target" tree or portable mbx "objects"
     default: target
+  isolate-objects-cache:
+    description: Use a private RUNNER_TEMP mbx store and bundle for GitHub objects caching; intended for disposable hosted runners
+    default: "false"
   save-on-workflow-dispatch:
     description: Save the GitHub cache after a successful workflow_dispatch run; enable only in trusted workflows
     default: "false"

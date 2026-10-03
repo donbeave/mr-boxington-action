@@ -48,6 +48,15 @@ import {
   type VerifiedReleaseAsset
 } from './lib.js'
 import {
+  assertObjectsBundleAbsent,
+  createObjectsCachePaths,
+  importObjectsBundle,
+  pathsFromObjectsCacheRoot,
+  reportObjectsResourcePhase,
+  saveIsolatedObjectsBundle,
+  type ObjectsCachePaths
+} from './objects-cache.js'
+import {
   dehydrateMbxShimBinaries,
   hasReusableCargoTarget,
   hydrateMbxShimBinaries,
@@ -61,6 +70,7 @@ const CACHE_ARCHIVE_STATE = 'mbx-cache-archive'
 const CACHE_EXPORT_GROUP_STATE = 'mbx-cache-export-group'
 const CACHE_PATHS_STATE = 'mbx-cache-paths'
 const CACHE_BUNDLE_FORM_STATE = 'mbx-cache-bundle-form'
+const CACHE_ISOLATION_ROOT_STATE = 'mbx-cache-isolation-root'
 const CARGO_WORKSPACE_STATE = 'mbx-cargo-workspace'
 const MBX_STATE = 'mbx-bin'
 const CACHE_ARCHIVE_NAME = 'github-actions-cache-v1.tar'
@@ -318,6 +328,10 @@ async function configureRemote(mbx: string): Promise<RemoteStatus> {
 async function main(): Promise<void> {
   const backend = parseBackend(core.getInput('backend'))
   const githubCacheMode = parseGithubCacheMode(core.getInput('github-cache-mode'))
+  const isolateObjectsCache = core.getBooleanInput('isolate-objects-cache')
+  if (isolateObjectsCache && (backend !== 'github' || githubCacheMode !== 'objects')) {
+    throw new Error('isolate-objects-cache requires backend github and github-cache-mode objects')
+  }
   const targetCache = backend === 'github' && githubCacheMode === 'target'
   if (backend === 'github') requireGithubCacheRuntime()
   const gcAuto = githubObjectGcDefault(backend, githubCacheMode)
@@ -369,15 +383,30 @@ async function main(): Promise<void> {
 
   let cacheArchive = ''
   let bundleForm: BundleForm = 'tar'
+  let isolatedObjectsPaths: ObjectsCachePaths | undefined
   if (githubCacheMode === 'objects') {
     if (!installed) throw new Error('mbx setup did not complete')
     bundleForm = supportsDirectoryBundle(installed.version) ? 'directory' : 'tar'
-    const cacheDir = await capture(installed.bin, ['cache', 'dir'])
-    await mkdir(cacheDir, {recursive: true})
-    cacheArchive = path.join(
-      cacheDir,
-      bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME
-    )
+    if (isolateObjectsCache) {
+      const runnerTemp = process.env.RUNNER_TEMP
+      if (!runnerTemp) throw new Error('RUNNER_TEMP is required by isolate-objects-cache')
+      isolatedObjectsPaths = await createObjectsCachePaths(runnerTemp, bundleForm)
+      core.exportVariable('MBX_CACHE_DIR', isolatedObjectsPaths.store)
+      const isolatedActionStore = path.join(isolatedObjectsPaths.store, 'actions')
+      const resolvedActionStore = await capture(installed.bin, ['cache', 'dir'])
+      if (path.resolve(resolvedActionStore) !== isolatedActionStore) {
+        throw new Error('mbx did not resolve MBX_CACHE_DIR to the private action store')
+      }
+      await mkdir(isolatedActionStore, {recursive: true})
+      cacheArchive = isolatedObjectsPaths.bundle
+    } else {
+      const cacheDir = await capture(installed.bin, ['cache', 'dir'])
+      await mkdir(cacheDir, {recursive: true})
+      cacheArchive = path.join(
+        cacheDir,
+        bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME
+      )
+    }
   }
   const exportGroup =
     githubCacheMode === 'objects'
@@ -468,6 +497,15 @@ async function main(): Promise<void> {
     targetToolDirectory
   ]
   const cachePaths = githubCacheMode === 'target' ? targetPaths : [cacheArchive]
+  if (isolatedObjectsPaths) {
+    core.saveState(CACHE_ISOLATION_ROOT_STATE, isolatedObjectsPaths.root)
+    await reportObjectsResourcePhase(
+      isolatedObjectsPaths,
+      'before-restore-import',
+      targetDirectory,
+      message => core.info(message)
+    )
+  }
   const restoredKey = await cache.restoreCache(cachePaths, primaryKey, restoreKeys)
   if (targetCache) {
     installed = await stageTargetCacheMbx(
@@ -481,7 +519,21 @@ async function main(): Promise<void> {
   core.saveState(POST_STATE, backend)
   core.saveState(MBX_STATE, installed.bin)
   if (restoredKey && githubCacheMode === 'objects') {
-    await exec.exec(installed.bin, ['cache', 'import', cacheArchive])
+    if (isolatedObjectsPaths) {
+      await importObjectsBundle(isolatedObjectsPaths, async bundlePath => {
+        await reportObjectsResourcePhase(
+          isolatedObjectsPaths!,
+          'before-cache-import',
+          targetDirectory,
+          message => core.info(message)
+        )
+        await exec.exec(installed!.bin, ['cache', 'import', bundlePath])
+      })
+    } else {
+      await exec.exec(installed.bin, ['cache', 'import', cacheArchive])
+    }
+  } else if (isolatedObjectsPaths) {
+    await assertObjectsBundleAbsent(isolatedObjectsPaths)
   } else if (restoredKey && githubCacheMode === 'target') {
     const hydrated = await hydrateMbxShimBinaries(targetDirectory, installed.bin)
     if (hydrated > 0) core.info(`Restored ${hydrated} mbx build-script shim binaries`)
@@ -493,6 +545,7 @@ async function main(): Promise<void> {
 
   core.saveState(CACHE_ARCHIVE_STATE, cacheArchive)
   core.saveState(CACHE_BUNDLE_FORM_STATE, bundleForm)
+  if (isolatedObjectsPaths) core.saveState(CACHE_ISOLATION_ROOT_STATE, isolatedObjectsPaths.root)
   core.saveState(CACHE_EXPORT_GROUP_STATE, exportGroup)
   core.saveState(CACHE_PATHS_STATE, JSON.stringify(cachePaths))
   core.saveState(CARGO_WORKSPACE_STATE, cargoWorkspace)
@@ -539,6 +592,56 @@ async function main(): Promise<void> {
 
 async function post(): Promise<void> {
   const postState = core.getState(POST_STATE)
+  const isolationRoot = core.getState(CACHE_ISOLATION_ROOT_STATE)
+  if (isolationRoot && (postState === 'github-save' || postState === 'github-restore-only')) {
+    const savedForm = core.getState(CACHE_BUNDLE_FORM_STATE)
+    if (savedForm !== 'directory' && savedForm !== 'tar') {
+      throw new Error('isolated objects cache has an invalid bundle form in action state')
+    }
+    const form: BundleForm = savedForm
+    const runnerTemp = process.env.RUNNER_TEMP
+    if (!runnerTemp) throw new Error('RUNNER_TEMP is required by isolate-objects-cache post step')
+    const isolatedPaths = await pathsFromObjectsCacheRoot(runnerTemp, isolationRoot, form)
+    if (core.getState(CACHE_ARCHIVE_STATE) !== isolatedPaths.bundle) {
+      throw new Error('isolated objects cache bundle path does not match action state')
+    }
+    const primaryKey = core.getState(CACHE_KEY_STATE)
+    if (!primaryKey) throw new Error('isolated objects cache is missing its primary key')
+    const cargoWorkspace = core.getState(CARGO_WORKSPACE_STATE) || process.cwd()
+    const targetDirectory = path.join(cargoWorkspace, 'target')
+    const result = await saveIsolatedObjectsBundle({
+      paths: isolatedPaths,
+      primaryKey,
+      saveEligible: postState === 'github-save',
+      exactHit: core.getState(CACHE_HIT_STATE) === 'true',
+      cargoTarget: targetDirectory,
+      exportBundle: async bundlePath => {
+        const group = core.getState(CACHE_EXPORT_GROUP_STATE)
+        if (!group) throw new Error('isolated objects cache is missing its export group')
+        const exportArgs =
+          form === 'directory'
+            ? ['cache', 'export', '--group', group, '--format', 'directory', bundlePath]
+            : ['cache', 'export', '--group', group, bundlePath]
+        let output = ''
+        const exitCode = await exec.exec(core.getState(MBX_STATE), exportArgs, {
+          ignoreReturnCode: true,
+          listeners: {
+            stdout: data => (output += data.toString()),
+            stderr: data => (output += data.toString())
+          }
+        })
+        return {exitCode, output}
+      },
+      isEmptyExport,
+      saveCache: (paths, key) => cache.saveCache(paths, key),
+      emit: message => core.info(message),
+      warn: message => core.warning(message)
+    })
+    if (result === 'exact-hit') {
+      core.info(`Exact cache ${core.getState(CACHE_KEY_STATE)} already exists; not saving it again`)
+    }
+    return
+  }
   if (postState !== 'github-save') return
   const primaryKey = core.getState(CACHE_KEY_STATE)
   if (core.getState(CACHE_HIT_STATE) === 'true') {
