@@ -17,6 +17,7 @@ import {
   callingCard,
   type CallingCardRow,
   cargoTargetDirectory,
+  effectiveRestoreKeys,
   generatedKey,
   generatedRestoreKey,
   githubCacheGeneration,
@@ -29,6 +30,7 @@ import {
   parseBackend,
   parseGithubCacheMode,
   parsedMbxVersion,
+  primaryCacheKey,
   pullRequestRestoreKey,
   type PullRequestRepositories,
   remoteExports,
@@ -431,18 +433,24 @@ async function main(): Promise<void> {
   )
   const baseSha = context.payload.pull_request?.base.sha ?? context.sha
   const sha = cacheRevision(context.eventName, baseSha, save, context.runId, context.runAttempt)
-  const primaryKey =
-    core.getInput('cache-key') ||
+  const primaryKey = primaryCacheKey(
+    core.getInput('cache-key'),
+    core.getInput('cache-key-suffix'),
     generatedKey(process.platform, process.arch, generation, toolchain, sha)
-  const restoreKeys = core.getMultilineInput('restore-keys').filter(Boolean)
-  if (restoreKeys.length === 0) {
+  )
+  const explicitRestoreKeys = core.getMultilineInput('restore-keys').filter(Boolean)
+  const generatedRestoreKeys: string[] = []
+  if (explicitRestoreKeys.length === 0) {
     if (save && context.eventName === 'pull_request') {
-      restoreKeys.push(
+      generatedRestoreKeys.push(
         pullRequestRestoreKey(process.platform, process.arch, generation, toolchain, baseSha)
       )
     }
-    restoreKeys.push(generatedRestoreKey(process.platform, process.arch, generation, toolchain))
+    generatedRestoreKeys.push(
+      generatedRestoreKey(process.platform, process.arch, generation, toolchain)
+    )
   }
+  const restoreKeys = effectiveRestoreKeys(explicitRestoreKeys, generatedRestoreKeys)
   const cargoHome = process.env.CARGO_HOME || path.join(homedir(), '.cargo')
   const targetToolDirectory = path.join(
     process.env.RUNNER_TEMP || path.join(homedir(), '.cache'),

@@ -1,3 +1,4 @@
+import {Buffer} from 'node:buffer'
 import path from 'node:path'
 import {describe, expect, it} from 'vitest'
 import {
@@ -7,6 +8,7 @@ import {
   canReuseCachedMbx,
   callingCard,
   cargoTargetDirectory,
+  effectiveRestoreKeys,
   generatedKey,
   generatedRestoreKey,
   githubCacheGeneration,
@@ -19,6 +21,7 @@ import {
   parseBackend,
   parseGithubCacheMode,
   parsedMbxVersion,
+  primaryCacheKey,
   pullRequestRestoreKey,
   remoteExports,
   remoteStatus,
@@ -209,6 +212,46 @@ describe('inputs', () => {
     )
     expect(githubCacheGeneration('v2', 'objects')).toBe('v2')
     expect(githubCacheGeneration('v2', 'target')).toBe('v2-target')
+  })
+
+  it('keeps generated keys unchanged without a suffix and scopes only the primary key', () => {
+    const generated = generatedKey('linux', 'x64', 'v2', 'rust-0123456789ab', 'abc')
+    const restorePrefix = generatedRestoreKey('linux', 'x64', 'v2', 'rust-0123456789ab')
+    expect(primaryCacheKey('', '', generated)).toBe(generated)
+    const firstJobKey = primaryCacheKey('', 'job-1', generated)
+    const secondJobKey = primaryCacheKey('', 'job-2', generated)
+    expect(firstJobKey).toBe(`${generated}-job-1`)
+    expect(secondJobKey).toBe(`${generated}-job-2`)
+    expect(firstJobKey.startsWith(restorePrefix)).toBe(true)
+    expect(secondJobKey.startsWith(restorePrefix)).toBe(true)
+    expect(restorePrefix).toBe('linux-x64-mbx-v2-rust-0123456789ab-')
+  })
+
+  it('rejects unsafe suffixes and bounds the complete generated key to 512 bytes', () => {
+    const generated = generatedKey('linux', 'x64', 'v2', 'rust-0123456789ab', 'abc')
+    expect(() => primaryCacheKey('', 'job/3', generated)).toThrow(/only ASCII/)
+
+    const fittingKey = primaryCacheKey('', 'job', 'x'.repeat(508))
+    expect(fittingKey).toHaveLength(512)
+    expect(() => primaryCacheKey('', 'jobs', 'x'.repeat(508))).toThrow(/at most 512 bytes/)
+    expect(() => primaryCacheKey('', 'a'.repeat(512), 'x')).toThrow(/at most 512 bytes/)
+
+    expect(Buffer.byteLength(primaryCacheKey('', 'job', 'é'.repeat(254)), 'utf8')).toBe(512)
+  })
+
+  it('rejects a suffix alongside an explicit complete primary key', () => {
+    expect(() => primaryCacheKey('complete-key', 'job-3', 'generated-key')).toThrow(
+      /cannot be used together/
+    )
+    expect(primaryCacheKey('complete-key', '', 'generated-key')).toBe('complete-key')
+  })
+
+  it('passes explicit restore prefixes through unchanged when primary keys are scoped', () => {
+    const explicitRestoreKeys = ['matrix-job-', 'shared-build-']
+    expect(effectiveRestoreKeys(explicitRestoreKeys, ['generated-default-'])).toBe(
+      explicitRestoreKeys
+    )
+    expect(effectiveRestoreKeys([], ['generated-default-'])).toEqual(['generated-default-'])
   })
 
   it("asks for a saving pull request's own runs without naming its base entry", () => {

@@ -1,3 +1,4 @@
+import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import path from 'node:path'
 
@@ -284,6 +285,30 @@ export function generatedKey(
   return `${os}-${arch}-mbx-${generation}-${toolchain}-${sha}`
 }
 
+const MAX_CACHE_KEY_BYTES = 512
+
+/** Resolve the primary key while keeping generated restore prefixes shareable. */
+export function primaryCacheKey(
+  cacheKeyOverride: string,
+  suffix: string,
+  generated: string
+): string {
+  if (cacheKeyOverride && suffix) {
+    throw new Error('cache-key and cache-key-suffix cannot be used together')
+  }
+  if (cacheKeyOverride) return cacheKeyOverride
+  if (!suffix) return generated
+
+  if (!/^[A-Za-z0-9._-]+$/.test(suffix)) {
+    throw new Error('cache-key-suffix may contain only ASCII letters, numbers, ., _, and -')
+  }
+  const scoped = `${generated}-${suffix}`
+  if (Buffer.byteLength(scoped, 'utf8') > MAX_CACHE_KEY_BYTES) {
+    throw new Error(`generated cache key with cache-key-suffix must be at most ${MAX_CACHE_KEY_BYTES} bytes`)
+  }
+  return scoped
+}
+
 export function generatedRestoreKey(
   os: string,
   arch: string,
@@ -291,6 +316,14 @@ export function generatedRestoreKey(
   toolchain: string
 ): string {
   return `${os}-${arch}-mbx-${generation}-${toolchain}-`
+}
+
+/** Use caller prefixes as given, or the generated defaults when none were provided. */
+export function effectiveRestoreKeys(
+  explicit: string[],
+  generated: string[]
+): string[] {
+  return explicit.length > 0 ? explicit : generated
 }
 
 /**

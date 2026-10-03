@@ -19,6 +19,9 @@ inputs:
   cache-key:
     description: Complete primary key for the GitHub cache backend
     required: false
+  cache-key-suffix:
+    description: Safe suffix appended to the generated primary key; cannot be used with cache-key
+    required: false
   restore-keys:
     description: Newline-separated restore key prefixes for the GitHub cache backend
     required: false
