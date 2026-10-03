@@ -1,4 +1,3 @@
-import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import path from 'node:path'
 
@@ -285,7 +284,7 @@ export function generatedKey(
   return `${os}-${arch}-mbx-${generation}-${toolchain}-${sha}`
 }
 
-const MAX_CACHE_KEY_BYTES = 512
+const MAX_CACHE_KEY_LENGTH = 512
 
 /** Resolve the primary key while keeping generated restore prefixes shareable. */
 export function primaryCacheKey(
@@ -303,8 +302,10 @@ export function primaryCacheKey(
     throw new Error('cache-key-suffix may contain only ASCII letters, numbers, ., _, and -')
   }
   const scoped = `${generated}-${suffix}`
-  if (Buffer.byteLength(scoped, 'utf8') > MAX_CACHE_KEY_BYTES) {
-    throw new Error(`generated cache key with cache-key-suffix must be at most ${MAX_CACHE_KEY_BYTES} bytes`)
+  if (scoped.length > MAX_CACHE_KEY_LENGTH) {
+    throw new Error(
+      `generated cache key with cache-key-suffix must be at most ${MAX_CACHE_KEY_LENGTH} characters`
+    )
   }
   return scoped
 }

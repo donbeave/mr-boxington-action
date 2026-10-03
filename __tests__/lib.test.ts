@@ -227,16 +227,19 @@ describe('inputs', () => {
     expect(restorePrefix).toBe('linux-x64-mbx-v2-rust-0123456789ab-')
   })
 
-  it('rejects unsafe suffixes and bounds the complete generated key to 512 bytes', () => {
+  it('rejects unsafe suffixes and bounds the complete generated key to 512 characters', () => {
     const generated = generatedKey('linux', 'x64', 'v2', 'rust-0123456789ab', 'abc')
     expect(() => primaryCacheKey('', 'job/3', generated)).toThrow(/only ASCII/)
 
     const fittingKey = primaryCacheKey('', 'job', 'x'.repeat(508))
     expect(fittingKey).toHaveLength(512)
-    expect(() => primaryCacheKey('', 'jobs', 'x'.repeat(508))).toThrow(/at most 512 bytes/)
-    expect(() => primaryCacheKey('', 'a'.repeat(512), 'x')).toThrow(/at most 512 bytes/)
+    expect(() => primaryCacheKey('', 'jobs', 'x'.repeat(508))).toThrow(/at most 512 characters/)
+    expect(() => primaryCacheKey('', 'a'.repeat(512), 'x')).toThrow(/at most 512 characters/)
 
-    expect(Buffer.byteLength(primaryCacheKey('', 'job', 'é'.repeat(254)), 'utf8')).toBe(512)
+    const multibyteBaseKey = primaryCacheKey('', 'job', 'é'.repeat(508))
+    expect(multibyteBaseKey).toHaveLength(512)
+    expect(Buffer.byteLength(multibyteBaseKey, 'utf8')).toBeGreaterThan(512)
+    expect(() => primaryCacheKey('', 'job', 'é'.repeat(509))).toThrow(/at most 512 characters/)
   })
 
   it('rejects a suffix alongside an explicit complete primary key', () => {

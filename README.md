@@ -157,7 +157,7 @@ keys while keeping the generated restore prefixes shared:
 The suffix is appended after the complete generated key and does not alter
 restore prefixes, so a job can warm-start from another job's compatible entry.
 It accepts ASCII letters, numbers, periods, underscores, or hyphens, and the
-final generated key must be at most 512 bytes. `cache-key-suffix` cannot be
+final generated key must be at most 512 characters. `cache-key-suffix` cannot be
 combined with `cache-key`; use `cache-key` alone when supplying the complete
 primary key yourself.
 
