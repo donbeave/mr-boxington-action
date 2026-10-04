@@ -1,5 +1,5 @@
 import {Buffer} from 'node:buffer'
-import {lstat, mkdir, mkdtemp, opendir, readFile, realpath, rm, rmdir, statfs} from 'node:fs/promises'
+import {chmod, lstat, mkdir, mkdtemp, opendir, readFile, realpath, rm, rmdir, statfs} from 'node:fs/promises'
 import path from 'node:path'
 
 export type ObjectsBundleForm = 'directory' | 'tar'
@@ -79,6 +79,41 @@ async function maybeLstat(value: string) {
     if (errorCode(error) === 'ENOENT') return MISSING
     throw error
   }
+}
+
+async function makeTreeRemovable(target: string): Promise<void> {
+  const info = await maybeLstat(target)
+  if (info === MISSING || info.isSymbolicLink()) return
+
+  const permissions = Number(info.mode & 0o7777n)
+  if (info.isDirectory()) {
+    // MBX intentionally stores content-addressed OUT_DIR trees as 0555.
+    // Unlink needs write permission on the containing directory, so restore
+    // owner access before walking and deleting this action-owned tree.
+    await chmod(target, permissions | 0o700)
+    const entries = await opendir(target)
+    try {
+      let entry = await entries.read()
+      while (entry) {
+        await makeTreeRemovable(path.join(target, entry.name))
+        entry = await entries.read()
+      }
+    } finally {
+      await entries.close()
+    }
+    return
+  }
+
+  // Windows represents read-only files with the write bit cleared. POSIX
+  // unlink only needs the parent directory to be writable.
+  if (process.platform === 'win32' && (permissions & 0o200) === 0) {
+    await chmod(target, permissions | 0o200)
+  }
+}
+
+async function removePrivateTree(target: string): Promise<void> {
+  await makeTreeRemovable(target)
+  await rm(target, {recursive: true, force: false})
 }
 
 function isWithin(parent: string, child: string): boolean {
@@ -307,7 +342,7 @@ export async function importObjectsBundle(
   const info = await maybeLstat(paths.bundle)
   if (info !== MISSING) {
     await validateObjectsCachePaths(paths)
-    await rm(paths.bundle, {recursive: true, force: false})
+    await removeObjectsBundle(paths)
   }
 }
 
@@ -316,14 +351,14 @@ export async function removeObjectsStore(paths: ObjectsCachePaths): Promise<void
   const info = await maybeLstat(paths.store)
   if (info === MISSING) return
   if (!info.isDirectory()) throw new Error('isolated mbx store is not a directory')
-  await rm(paths.store, {recursive: true, force: false})
+  await removePrivateTree(paths.store)
 }
 
 export async function removeObjectsBundle(paths: ObjectsCachePaths): Promise<void> {
   await validateObjectsCachePaths(paths)
   const info = await maybeLstat(paths.bundle)
   if (info === MISSING) return
-  await rm(paths.bundle, {recursive: true, force: false})
+  await removePrivateTree(paths.bundle)
 }
 
 export async function cleanupIsolatedObjectsCachePost(paths: ObjectsCachePaths): Promise<void> {

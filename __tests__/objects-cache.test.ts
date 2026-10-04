@@ -1,4 +1,4 @@
-import {mkdtemp, mkdir, lstat, realpath, rm, symlink, writeFile} from 'node:fs/promises'
+import {chmod, mkdtemp, mkdir, lstat, realpath, rm, symlink, writeFile} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as core from '@actions/core'
@@ -10,6 +10,7 @@ import {
   assertIsolatedObjectsActionStore,
   assertObjectsBundleAbsent,
   classifyCacheSaveFailure,
+  cleanupIsolatedObjectsCachePost,
   createObjectsCachePaths,
   importObjectsBundle,
   measureTree,
@@ -38,6 +39,14 @@ async function pathExists(target: string): Promise<boolean> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
+  }
+}
+
+async function chmodIfPresent(target: string, mode: number): Promise<void> {
+  try {
+    await chmod(target, mode)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 }
 
@@ -499,6 +508,58 @@ describe('isolated objects cache paths', () => {
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/Could not remove isolated mbx cache after post failure/)
     expect(await pathExists(paths.root)).toBe(true)
+  })
+
+  it('removes immutable MBX out-dir trees without following nested symlinks', async () => {
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const storeOutDirs = path.join(paths.store, 'out-dirs')
+    const storeVersionDir = path.join(storeOutDirs, 'v1')
+    const storeHashDir = path.join(paths.store, 'out-dirs', 'v1', 'digest')
+    const storeFile = path.join(storeHashDir, 'private.rs')
+    const bundleOutDirs = path.join(paths.bundle, 'out-dirs')
+    const bundleVersionDir = path.join(bundleOutDirs, 'v1')
+    const bundleHashDir = path.join(paths.bundle, 'out-dirs', 'v1', 'digest')
+    const bundleFile = path.join(bundleHashDir, 'private.rs')
+    const outside = path.join(runnerTemp, 'outside')
+    const outsideFile = path.join(outside, 'keep')
+    await mkdir(storeHashDir, {recursive: true})
+    await writeFile(storeFile, 'store output')
+    await mkdir(bundleHashDir, {recursive: true})
+    await writeFile(bundleFile, 'bundle output')
+    await mkdir(outside)
+    await writeFile(outsideFile, 'external')
+    if (process.platform !== 'win32') {
+      await symlink(outside, path.join(storeHashDir, 'external'), 'dir')
+      await chmod(outside, 0o555)
+    }
+    await chmod(storeFile, 0o444)
+    await chmod(storeOutDirs, 0o555)
+    await chmod(storeVersionDir, 0o555)
+    await chmod(storeHashDir, 0o555)
+    await chmod(bundleFile, 0o444)
+    await chmod(bundleOutDirs, 0o555)
+    await chmod(bundleVersionDir, 0o555)
+    await chmod(bundleHashDir, 0o555)
+
+    try {
+      await cleanupIsolatedObjectsCachePost(paths)
+      expect(await pathExists(paths.root)).toBe(false)
+      expect(await pathExists(outsideFile)).toBe(true)
+      if (process.platform !== 'win32') {
+        expect((await lstat(outside)).mode & 0o777).toBe(0o555)
+      }
+    } finally {
+      await chmodIfPresent(storeOutDirs, 0o700)
+      await chmodIfPresent(storeVersionDir, 0o700)
+      await chmodIfPresent(storeHashDir, 0o700)
+      await chmodIfPresent(storeFile, 0o600)
+      await chmodIfPresent(bundleOutDirs, 0o700)
+      await chmodIfPresent(bundleVersionDir, 0o700)
+      await chmodIfPresent(bundleHashDir, 0o700)
+      await chmodIfPresent(bundleFile, 0o600)
+      await chmodIfPresent(outside, 0o700)
+    }
   })
 
   it('imports a valid bundle and removes it only after import succeeds', async () => {
