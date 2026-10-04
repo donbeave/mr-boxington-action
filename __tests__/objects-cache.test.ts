@@ -412,7 +412,7 @@ describe('isolated objects bundle save lifecycle', () => {
       isEmptyExport: () => false,
       saveCache: async () => {
         core.warning(
-          'Failed to save: Unable to finalize cache with key generated-key, another job may be finalizing this cache.'
+          'Unable to finalize cache with key generated-key, another job may be finalizing this cache.'
         )
         return 17
       },
@@ -644,6 +644,16 @@ describe('isolated objects bundle save lifecycle', () => {
       '::warning::Failed to save: Unable to finalize cache with key generated-key, another job may be finalizing this cache.\n'
     )
     expect(classifyCacheSaveFailure(v2FinalizeContention)).toBe('service-reservation')
+    const bareV2FinalizeContention = await captureWarning(
+      'Unable to finalize cache with key generated-key, another job may be finalizing this cache.'
+    )
+    expect(bareV2FinalizeContention).toBe(
+      '::warning::Unable to finalize cache with key generated-key, another job may be finalizing this cache.\n'
+    )
+    expect(classifyCacheSaveFailure(bareV2FinalizeContention)).toBe('service-reservation')
+    expect(classifyCacheSaveFailure(await captureWarning('cache entry not found'))).toBe(
+      'unknown'
+    )
 
     const terminalNoSpace = await captureWarning(
       'Failed to save: tar failed: No space left on device (os error 28)'
