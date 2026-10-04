@@ -357,12 +357,26 @@ export async function withIsolatedObjectsPostCleanup<T>(
   }
 }
 
-async function canonicalExistingDirectory(target: string): Promise<string | undefined> {
-  let current = path.resolve(target)
+async function canonicalExistingDirectory(
+  target: string,
+  followTargetRootSymlink = false
+): Promise<string | undefined> {
+  const targetRoot = path.resolve(target)
+  let current = targetRoot
   while (true) {
     const found = await maybeLstat(current)
     if (found !== MISSING) {
-      if (found.isSymbolicLink()) return undefined
+      if (found.isSymbolicLink()) {
+        if (followTargetRootSymlink && current === targetRoot) {
+          try {
+            const resolved = await realpath(current)
+            if ((await lstat(resolved)).isDirectory()) return resolved
+          } catch (error) {
+            if (errorCode(error) !== 'ENOENT') throw error
+          }
+        }
+        return undefined
+      }
       if (!found.isDirectory()) current = path.dirname(current)
       else return realpath(current)
     } else {
@@ -397,8 +411,12 @@ async function linuxMountIdentity(target: string): Promise<string | undefined> {
   }
 }
 
-async function mountUsage(target: string, role: string): Promise<MountUsage | undefined> {
-  const existingDirectory = await canonicalExistingDirectory(target)
+async function mountUsage(
+  target: string,
+  role: string,
+  followTargetRootSymlink = false
+): Promise<MountUsage | undefined> {
+  const existingDirectory = await canonicalExistingDirectory(target, followTargetRootSymlink)
   if (!existingDirectory) return undefined
   const [fsStats, targetStats, identity] = await Promise.all([
     statfs(existingDirectory, {bigint: true}),
@@ -420,7 +438,7 @@ async function mountUsages(paths: ObjectsCachePaths, cargoTarget: string): Promi
     mountUsage(paths.root, 'objectsCache'),
     mountUsage(paths.store, 'mbxStore'),
     mountUsage(paths.bundle, 'bundle'),
-    mountUsage(cargoTarget, 'cargoTarget')
+    mountUsage(cargoTarget, 'cargoTarget', true)
   ])
   const unique = new Map<string, MountUsage>()
   for (const sample of samples) {

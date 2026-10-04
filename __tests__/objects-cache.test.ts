@@ -17,6 +17,7 @@ import {
   reportObjectsResourcePhase,
   saveIsolatedObjectsBundle,
   withIsolatedObjectsPostCleanup,
+  withObjectsResourceSampler,
   validateObjectsBundle,
   validateObjectsCachePaths,
   withBoundedActionOutput
@@ -136,6 +137,30 @@ describe('isolated objects cache paths', () => {
     expect(cargo?.files).toBe(1)
     expect(cargo?.apparentBytes).toBe(String(Buffer.byteLength('target-data')))
     expect(events[0]).toContain('"phase":"symlink-target-test"')
+  })
+
+  it('samples free space for a symlinked Cargo target on another filesystem', async () => {
+    if (process.platform === 'win32') return
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const cargoTarget = path.join(runnerTemp, 'workspace-target')
+    await symlink('/dev', cargoTarget, 'dir')
+    const events: string[] = []
+    await withObjectsResourceSampler(paths, cargoTarget, 'symlink-mount-test', async () => {}, event => {
+      events.push(event)
+    })
+    const sampleEvent = events.find(event => event.startsWith('Objects cache sample '))
+    if (!sampleEvent) throw new Error('resource sampler emitted no filesystem sample')
+    const sample = JSON.parse(sampleEvent.slice('Objects cache sample '.length)) as {
+      mounts: Array<{identity: string; roles: string[]; freeBytes: string; freeInodes: string}>
+    }
+    const runnerTempMount = sample.mounts.find(mount => mount.roles.includes('runnerTemp'))
+    const cargoTargetMount = sample.mounts.find(mount => mount.roles.includes('cargoTarget'))
+    expect(runnerTempMount).toBeDefined()
+    expect(cargoTargetMount).toBeDefined()
+    expect(cargoTargetMount?.identity).not.toBe(runnerTempMount?.identity)
+    expect(cargoTargetMount?.freeBytes).toMatch(/^\d+$/)
+    expect(cargoTargetMount?.freeInodes).toMatch(/^\d+$/)
   })
 
   it('cleans the validated private root after successful and failed post operations', async () => {
