@@ -4,7 +4,7 @@ import path from 'node:path'
 import * as core from '@actions/core'
 import {getCacheVersion} from '../node_modules/@actions/cache/lib/internal/cacheUtils.js'
 import {CompressionMethod} from '../node_modules/@actions/cache/lib/internal/constants.js'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {generatedKey, primaryCacheKey} from '../src/lib.js'
 import {
   assertIsolatedObjectsActionStore,
@@ -39,6 +39,18 @@ async function pathExists(target: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+  return {promise, resolve}
+}
+
+function sampledMount(role: string, freeBytes: string, freeInodes: string) {
+  return {identity: 'test-filesystem', roles: [role], freeBytes, freeInodes}
 }
 
 afterEach(async () => {
@@ -161,6 +173,266 @@ describe('isolated objects cache paths', () => {
     expect(cargoTargetMount?.identity).not.toBe(runnerTempMount?.identity)
     expect(cargoTargetMount?.freeBytes).toMatch(/^\d+$/)
     expect(cargoTargetMount?.freeInodes).toMatch(/^\d+$/)
+  })
+
+  it('awaits an active scan and a fresh final scan before emitting the resource summary', async () => {
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const operationStarted = deferred<void>()
+    const finishOperation = deferred<void>()
+    const periodicScanStarted = deferred<void>()
+    const finishPeriodicScan = deferred<void>()
+    const finalScanStarted = deferred<void>()
+    const finishFinalScan = deferred<void>()
+    const events: string[] = []
+    let mountCalls = 0
+    let archiveCalls = 0
+
+    vi.useFakeTimers()
+    try {
+      const run = withObjectsResourceSampler(
+        paths,
+        path.join(runnerTemp, 'workspace', 'target'),
+        'deferred-scan-test',
+        async () => {
+          operationStarted.resolve(undefined)
+          await finishOperation.promise
+          return 'complete'
+        },
+        event => events.push(event),
+        {
+          intervalMs: 10,
+          mountUsages: async () => {
+            mountCalls++
+            if (mountCalls === 2) {
+              periodicScanStarted.resolve(undefined)
+              await finishPeriodicScan.promise
+              return [sampledMount('runnerTemp', '200', '20')]
+            }
+            if (mountCalls === 3) {
+              finalScanStarted.resolve(undefined)
+              await finishFinalScan.promise
+              return [sampledMount('bundle', '100', '10')]
+            }
+            return [sampledMount('runnerTemp', '1000', '100')]
+          },
+          cacheArchiveFiles: async () => {
+            archiveCalls++
+            if (archiveCalls < 3) return {files: [], complete: true}
+            const size = archiveCalls === 3 ? 64n : 256n
+            return {
+              files: [
+                {
+                  path: path.join(runnerTemp, 'cache-save', 'cache.tgz'),
+                  size,
+                  allocated: size,
+                  mtimeMs: Number(size)
+                }
+              ],
+              complete: true
+            }
+          }
+        }
+      )
+
+      await operationStarted.promise
+      await vi.advanceTimersByTimeAsync(10)
+      await periodicScanStarted.promise
+      finishOperation.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(events).toEqual([])
+
+      finishPeriodicScan.resolve()
+      await finalScanStarted.promise
+      expect(events).toEqual([])
+
+      finishFinalScan.resolve()
+      const result = await run
+      expect(result.result).toBe('complete')
+      expect(result.archives).toMatchObject({
+        observed: true,
+        samples: 2,
+        maxObservedApparentBytes: '256',
+        maxObservedAllocatedBytes: '256'
+      })
+      expect(events).toHaveLength(1)
+      const summary = JSON.parse(events[0]!.slice('Objects cache sample '.length)) as {
+        sampleCount: number
+        mounts: Array<{roles: string[]; freeBytes: string; freeInodes: string}>
+        cacheArchiveStaging: {maxObservedApparentBytes: string | null}
+      }
+      expect(summary.sampleCount).toBe(3)
+      expect(summary.mounts).toEqual([
+        {identity: 'test-filesystem', roles: ['runnerTemp', 'bundle'], freeBytes: '100', freeInodes: '10'}
+      ])
+      expect(summary.cacheArchiveStaging.maxObservedApparentBytes).toBe('256')
+    } finally {
+      finishOperation.resolve(undefined)
+      finishPeriodicScan.resolve(undefined)
+      finishFinalScan.resolve(undefined)
+      vi.useRealTimers()
+    }
+  })
+
+  it('records sampler rejections, finishes final sampling, and preserves the operation error', async () => {
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const operationStarted = deferred<void>()
+    const periodicScanStarted = deferred<void>()
+    const finishPeriodicScan = deferred<void>()
+    const finalScanStarted = deferred<void>()
+    const finishFinalScan = deferred<void>()
+    const events: string[] = []
+    const operationError = new Error('original operation failure')
+    const diagnosticError = Object.assign(new Error('private path /secret/private'), {code: 'EIO'})
+    let mountCalls = 0
+    let archiveCalls = 0
+
+    vi.useFakeTimers()
+    try {
+      const run = withObjectsResourceSampler(
+        paths,
+        path.join(runnerTemp, 'workspace', 'target'),
+        'rejected-scan-test',
+        async () => {
+          operationStarted.resolve(undefined)
+          await periodicScanStarted.promise
+          throw operationError
+        },
+        event => events.push(event),
+        {
+          intervalMs: 10,
+          mountUsages: async () => {
+            mountCalls++
+            if (mountCalls === 2) {
+              periodicScanStarted.resolve(undefined)
+              await finishPeriodicScan.promise
+              throw diagnosticError
+            }
+            if (mountCalls === 3) {
+              finalScanStarted.resolve(undefined)
+              await finishFinalScan.promise
+              return [sampledMount('bundle', '500', '50')]
+            }
+            return [sampledMount('runnerTemp', '1000', '100')]
+          },
+          cacheArchiveFiles: async () => {
+            archiveCalls++
+            return {files: [], complete: true}
+          }
+        }
+      )
+      const outcome = run.then(
+        () => ({kind: 'resolved' as const}),
+        error => ({kind: 'rejected' as const, error})
+      )
+
+      await operationStarted.promise
+      await vi.advanceTimersByTimeAsync(10)
+      await periodicScanStarted.promise
+      await vi.advanceTimersByTimeAsync(0)
+      expect(events).toEqual([])
+
+      finishPeriodicScan.resolve(undefined)
+      await finalScanStarted.promise
+      expect(events).toEqual([])
+
+      finishFinalScan.resolve(undefined)
+      const settled = await outcome
+      expect(settled.kind).toBe('rejected')
+      if (settled.kind === 'rejected') expect(settled.error).toBe(operationError)
+      expect(events).toHaveLength(1)
+      const summaryText = events[0]!.slice('Objects cache sample '.length)
+      expect(summaryText).not.toContain('/secret/private')
+      const summary = JSON.parse(summaryText) as {
+        sampleCount: number
+        samplingFailures: {count: number; countCapped: boolean; firstReason: string | null}
+        cacheArchiveStaging: {scanComplete: boolean; scanIncompleteReason: string | null}
+        mounts: Array<{freeBytes: string; freeInodes: string}>
+      }
+      expect(summary.sampleCount).toBe(3)
+      expect(summary.samplingFailures).toEqual({count: 1, countCapped: false, firstReason: 'code:EIO'})
+      expect(summary.cacheArchiveStaging).toMatchObject({
+        scanComplete: false,
+        scanIncompleteReason: 'resource-sample-failed'
+      })
+      expect(summary.mounts).toEqual([
+        {identity: 'test-filesystem', roles: ['runnerTemp', 'bundle'], freeBytes: '500', freeInodes: '50'}
+      ])
+      expect(archiveCalls).toBe(3)
+    } finally {
+      finishPeriodicScan.resolve(undefined)
+      finishFinalScan.resolve(undefined)
+      vi.useRealTimers()
+    }
+  })
+
+  it('includes BSD tar staging files in sampled cache archive accounting', async () => {
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const cacheTemp = path.join(runnerTemp, 'cache-save-staging')
+    const operationReady = deferred<void>()
+    const finishOperation = deferred<void>()
+    const periodicMountStarted = deferred<void>()
+    const finishPeriodicMount = deferred<void>()
+    const events: string[] = []
+    const tarBytes = Buffer.alloc(41, 0x7a)
+    let mountCalls = 0
+
+    vi.useFakeTimers()
+    try {
+      const run = withObjectsResourceSampler(
+        paths,
+        path.join(runnerTemp, 'workspace', 'target'),
+        'bsd-tar-staging-test',
+        async () => {
+          await mkdir(cacheTemp)
+          await writeFile(path.join(cacheTemp, 'cache.tar'), tarBytes)
+          operationReady.resolve(undefined)
+          await finishOperation.promise
+          return 'saved'
+        },
+        event => events.push(event),
+        {
+          intervalMs: 10,
+          mountUsages: async () => {
+            mountCalls++
+            if (mountCalls === 2) {
+              periodicMountStarted.resolve(undefined)
+              await finishPeriodicMount.promise
+            }
+            return []
+          }
+        }
+      )
+
+      await operationReady.promise
+      await vi.advanceTimersByTimeAsync(10)
+      await periodicMountStarted.promise
+      finishOperation.resolve(undefined)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(events).toEqual([])
+
+      finishPeriodicMount.resolve(undefined)
+      const result = await run
+      expect(result.result).toBe('saved')
+      expect(result.archives).toMatchObject({
+        observed: true,
+        maxObservedApparentBytes: String(tarBytes.byteLength)
+      })
+      expect(events).toHaveLength(1)
+      const summary = JSON.parse(events[0]!.slice('Objects cache sample '.length)) as {
+        cacheArchiveStaging: {observed: boolean; maxObservedApparentBytes: string | null}
+      }
+      expect(summary.cacheArchiveStaging).toMatchObject({
+        observed: true,
+        maxObservedApparentBytes: String(tarBytes.byteLength)
+      })
+    } finally {
+      finishOperation.resolve(undefined)
+      finishPeriodicMount.resolve(undefined)
+      vi.useRealTimers()
+    }
   })
 
   it('cleans the validated private root after successful and failed post operations', async () => {
