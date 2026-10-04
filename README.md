@@ -67,6 +67,14 @@ smaller because they omit the Cargo registry, which Cargo then downloads again
 inside the build; in paired measurements on GitHub-hosted runners it restored
 and built a small edit roughly ten seconds slower than the `target` payload.
 
+For disposable hosted runners, set `isolate-objects-cache: true` to keep the
+live mbx store under `RUNNER_TEMP` and save only the external exported bundle.
+After a valid bundle is exported, the action removes that isolated store before
+`actions/cache` stages its upload archive. Leave this off on persistent runners
+that rely on mbx's native warm store. Use one isolated objects-cache action
+invocation per job; its stable bundle path keeps the cache version shared across
+jobs and runs.
+
 From mbx 1.12.0 the bundle is a directory instead of a tar. `actions/cache`
 archives whatever path it is given, so a tar meant every byte was written twice
 on restore: once when the cache action unpacked its own archive, and again when
@@ -145,7 +153,21 @@ against its own `cargo metadata`:
 
 `cache-key` and newline-separated `restore-keys` are available when the default
 `${platform}-${architecture}-mbx-${generation}-${toolchain}-${commit}` layout
-is not enough.
+is not enough. Use `cache-key-suffix` to give parallel jobs distinct primary
+keys while keeping the generated restore prefixes shared:
+
+```yaml
+- uses: jdx/mr-boxington-action@v1
+  with:
+    cache-key-suffix: ${{ matrix.job }}
+```
+
+The suffix is appended after the complete generated key and does not alter
+restore prefixes, so a job can warm-start from another job's compatible entry.
+It accepts ASCII letters, numbers, periods, underscores, or hyphens, and the
+final generated key must be at most 512 characters. `cache-key-suffix` cannot be
+combined with `cache-key`; use `cache-key` alone when supplying the complete
+primary key yourself.
 
 ### Saving beyond the default branch
 
@@ -270,6 +292,7 @@ aliases for `remote-url` and `remote-mode`.
 | `github-token`              | `${{ github.token }}` | Token used when `GITHUB_TOKEN` is not exported                                 |
 | `cache-generation`          | `v1`                  | Generated GitHub cache key generation                                          |
 | `github-cache-mode`         | `target`              | GitHub payload: warm Cargo `target` tree or portable mbx `objects`             |
+| `isolate-objects-cache`     | `false`               | Put GitHub `objects` mode in a private `RUNNER_TEMP` store and save its bundle |
 | `save-on-workflow-dispatch` | `false`               | Save after a successful trusted `workflow_dispatch` run                        |
 | `save-on-pull-request`      | `false`               | Save after a successful same-repository pull request, scoped to it             |
 | `save-on-protected-branch`  | `false`               | Save after a successful push to a protected non-default branch                 |
@@ -277,6 +300,7 @@ aliases for `remote-url` and `remote-mode`.
 | `working-directory`         | `.`                   | Cargo workspace whose `target/` the `target` payload caches                    |
 | `cache-links`               | `auto`                | Cache native links; automatically enabled on Linux                             |
 | `cache-key`                 | generated             | Complete GitHub cache primary key                                              |
+| `cache-key-suffix`          |                       | Safe suffix for generated primary keys; restore prefixes stay shared           |
 | `restore-keys`              | generated             | Newline-separated GitHub restore prefixes                                      |
 | `remote-url`                |                       | Cache server URL or `s3://` bucket; keeps `MBX_REMOTE_URL` when omitted        |
 | `namespace`                 |                       | Remote namespace; keeps `MBX_REMOTE_NAMESPACE` when omitted                    |
