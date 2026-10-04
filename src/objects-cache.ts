@@ -1,5 +1,5 @@
 import {Buffer} from 'node:buffer'
-import {lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, statfs} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, opendir, readFile, realpath, rm, rmdir, statfs} from 'node:fs/promises'
 import path from 'node:path'
 
 export type ObjectsBundleForm = 'directory' | 'tar'
@@ -122,6 +122,15 @@ export async function pathsFromObjectsCacheRoot(
   return paths
 }
 
+export function assertIsolatedObjectsActionStore(
+  paths: ObjectsCachePaths,
+  resolvedActionStore: string
+): void {
+  if (path.resolve(resolvedActionStore) !== path.join(paths.store, 'actions')) {
+    throw new Error('mbx resolved its action store outside the private isolated cache store')
+  }
+}
+
 export async function validateObjectsCachePaths(paths: ObjectsCachePaths): Promise<void> {
   const runnerTemp = path.resolve(paths.runnerTemp)
   const root = path.resolve(paths.root)
@@ -167,7 +176,14 @@ export async function validateObjectsCachePaths(paths: ObjectsCachePaths): Promi
   }
 }
 
-async function measureTree(target: string, rejectSymlinks: boolean): Promise<TreeUsage> {
+export async function measureTree(
+  target: string,
+  rejectSymlinks: boolean,
+  entryLimit = MAX_TREE_ENTRIES
+): Promise<TreeUsage> {
+  if (!Number.isSafeInteger(entryLimit) || entryLimit < 1) {
+    throw new Error('tree measurement entry limit must be a positive safe integer')
+  }
   const rootStat = await lstat(target, {bigint: true})
   if (rootStat.isSymbolicLink()) throw new Error(`cache path ${path.basename(target)} is a symlink`)
   const pending = [target]
@@ -183,16 +199,16 @@ async function measureTree(target: string, rejectSymlinks: boolean): Promise<Tre
   let complete = true
 
   while (pending.length > 0) {
+    if (entriesScanned >= entryLimit) {
+      complete = false
+      if (rejectSymlinks) {
+        throw new Error(`exported cache bundle exceeds the ${entryLimit} entry validation limit`)
+      }
+      break
+    }
     const current = pending.pop()!
     const info = await lstat(current, {bigint: true})
     entriesScanned++
-    if (entriesScanned > MAX_TREE_ENTRIES) {
-      if (rejectSymlinks) {
-        throw new Error(`exported cache bundle exceeds the ${MAX_TREE_ENTRIES} entry validation limit`)
-      }
-      complete = false
-      break
-    }
     const inode = `${info.dev}:${info.ino}`
     const firstInode = !seenInodes.has(inode)
     if (firstInode) {
@@ -210,8 +226,17 @@ async function measureTree(target: string, rejectSymlinks: boolean): Promise<Tre
     }
     if (info.isDirectory()) {
       directories++
-      const names = await readdir(current)
-      for (const name of names) pending.push(path.join(current, name))
+      const children = await opendir(current)
+      for await (const child of children) {
+        if (entriesScanned + pending.length >= entryLimit) {
+          complete = false
+          break
+        }
+        pending.push(path.join(current, child.name))
+      }
+      if (complete === false && rejectSymlinks) {
+        throw new Error(`exported cache bundle exceeds the ${entryLimit} entry validation limit`)
+      }
     } else if (info.isFile()) {
       files++
       apparentBytes += info.size
@@ -285,6 +310,51 @@ export async function removeObjectsBundle(paths: ObjectsCachePaths): Promise<voi
   const info = await maybeLstat(paths.bundle)
   if (info === MISSING) return
   await rm(paths.bundle, {recursive: true, force: false})
+}
+
+export async function cleanupIsolatedObjectsCachePost(paths: ObjectsCachePaths): Promise<void> {
+  await validateObjectsCachePaths(paths)
+  await removeObjectsBundle(paths)
+  await removeObjectsStore(paths)
+  await validateObjectsCachePaths(paths)
+  const rootEntries = await opendir(paths.root)
+  try {
+    const firstEntry = await rootEntries.read()
+    if (firstEntry) {
+      throw new Error('isolated mbx cache root contains an unexpected entry after store cleanup')
+    }
+  } finally {
+    await rootEntries.close()
+  }
+  await rmdir(paths.root)
+}
+
+export async function withIsolatedObjectsPostCleanup<T>(
+  paths: ObjectsCachePaths,
+  operation: () => Promise<T>,
+  warn: (message: string) => void
+): Promise<T> {
+  let operationSucceeded = false
+  try {
+    const result = await operation()
+    operationSucceeded = true
+    return result
+  } finally {
+    try {
+      await cleanupIsolatedObjectsCachePost(paths)
+    } catch (cleanupError) {
+      if (operationSucceeded) throw cleanupError
+      const code = errorCode(cleanupError)
+      try {
+        warn(
+          `Could not remove isolated mbx cache after post failure${code ? ` (${code})` : ''}; ` +
+            'the original post error is preserved'
+        )
+      } catch {
+        // A secondary logging failure must not replace the original post error.
+      }
+    }
+  }
 }
 
 async function canonicalExistingDirectory(target: string): Promise<string | undefined> {
@@ -371,6 +441,21 @@ async function treeUsageIfPresent(target: string, rejectSymlinks = false): Promi
   return measureTree(target, rejectSymlinks)
 }
 
+async function cargoTargetUsageIfPresent(target: string): Promise<TreeUsage | null> {
+  const found = await maybeLstat(target)
+  if (found === MISSING) return null
+  try {
+    // Cargo accepts a symlinked target directory. Follow only this
+    // user-controlled telemetry root; action-owned bundle/store roots remain
+    // subject to strict canonical-path checks.
+    const measuredPath = found.isSymbolicLink() ? await realpath(target) : target
+    return await measureTree(measuredPath, false)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return null
+    throw error
+  }
+}
+
 export async function reportObjectsResourcePhase(
   paths: ObjectsCachePaths,
   phase: string,
@@ -388,7 +473,7 @@ export async function reportObjectsResourcePhase(
     treeUsageIfPresent(path.join(paths.store, 'actions')),
     treeUsageIfPresent(path.join(paths.store, 'targets'))
   ])
-  const targetUsage = cachedCargoTarget ?? (await treeUsageIfPresent(cargoTarget))
+  const targetUsage = cachedCargoTarget ?? (await cargoTargetUsageIfPresent(cargoTarget))
   const cargo = targetUsage
     ? {...targetUsage, capturedAt: cachedCargoTarget?.capturedAt ?? phase}
     : null
@@ -413,31 +498,66 @@ export async function reportObjectsResourcePhase(
 export interface SampledArchiveUsage {
   observed: boolean
   samples: number
-  peakApparentBytes: string | null
-  peakAllocatedBytes: string | null
+  maxObservedApparentBytes: string | null
+  maxObservedAllocatedBytes: string | null
+  scanComplete: boolean
+  scanLimit: number
+  scanIncompleteReason: string | null
 }
 
-async function cacheArchiveFiles(runnerTemp: string): Promise<Array<{path: string; size: bigint; allocated: bigint; mtimeMs: number}>> {
+interface CacheArchiveFile {
+  path: string
+  size: bigint
+  allocated: bigint
+  mtimeMs: number
+}
+
+interface CacheArchiveScan {
+  files: CacheArchiveFile[]
+  complete: boolean
+  incompleteReason?: string
+}
+
+async function cacheArchiveFiles(runnerTemp: string): Promise<CacheArchiveScan> {
   const archives: Array<{path: string; size: bigint; allocated: bigint; mtimeMs: number}> = []
-  let children: string[]
+  let children
   try {
-    children = await readdir(runnerTemp)
+    children = await opendir(runnerTemp)
   } catch {
-    return archives
+    return {files: archives, complete: false, incompleteReason: 'could-not-open-runner-temp'}
   }
-  for (const child of children) {
-    const folder = path.join(runnerTemp, child)
-    const folderStat = await maybeLstat(folder)
-    if (folderStat === MISSING || !folderStat.isDirectory() || folderStat.isSymbolicLink()) continue
-    for (const name of ['cache.tgz', 'cache.tzst']) {
-      const file = path.join(folder, name)
-      const info = await maybeLstat(file)
-      if (info !== MISSING && info.isFile()) {
-        archives.push({path: file, size: info.size, allocated: info.blocks * 512n, mtimeMs: Number(info.mtimeNs / 1_000_000n)})
+
+  let entriesScanned = 0
+  try {
+    for await (const child of children) {
+      if (entriesScanned >= MAX_TREE_ENTRIES) {
+        return {files: archives, complete: false, incompleteReason: 'runner-temp-entry-limit'}
+      }
+      entriesScanned++
+      if (!child.isDirectory()) continue
+      const folder = path.join(runnerTemp, child.name)
+      const folderStat = await maybeLstat(folder)
+      if (folderStat === MISSING || !folderStat.isDirectory() || folderStat.isSymbolicLink()) continue
+      for (const name of ['cache.tgz', 'cache.tzst']) {
+        const file = path.join(folder, name)
+        const info = await maybeLstat(file)
+        if (info !== MISSING && info.isFile()) {
+          if (archives.length >= MAX_TREE_ENTRIES) {
+            return {files: archives, complete: false, incompleteReason: 'runner-temp-archive-limit'}
+          }
+          archives.push({
+            path: file,
+            size: info.size,
+            allocated: info.blocks * 512n,
+            mtimeMs: Number(info.mtimeNs / 1_000_000n)
+          })
+        }
       }
     }
+  } catch {
+    return {files: archives, complete: false, incompleteReason: 'runner-temp-scan-failed'}
   }
-  return archives
+  return {files: archives, complete: true}
 }
 
 export async function withObjectsResourceSampler<T>(
@@ -448,14 +568,23 @@ export async function withObjectsResourceSampler<T>(
   emit: (message: string) => void
 ): Promise<{result: T; archives: SampledArchiveUsage}> {
   const minima = new Map<string, MountUsage>()
-  const archive = {observed: false, samples: 0, peakApparentBytes: null as string | null, peakAllocatedBytes: null as string | null}
+  const baselineScan = await cacheArchiveFiles(paths.runnerTemp)
+  const archive: SampledArchiveUsage = {
+    observed: false,
+    samples: 0,
+    maxObservedApparentBytes: null,
+    maxObservedAllocatedBytes: null,
+    scanComplete: baselineScan.complete,
+    scanLimit: MAX_TREE_ENTRIES,
+    scanIncompleteReason: baselineScan.incompleteReason ?? null
+  }
   let sampling = false
   let sampleCount = 0
   const startTime = Date.now()
   let previousSampleAt: number | undefined
   let maxObservedIntervalMs = 0
   const baseline = new Map(
-    (await cacheArchiveFiles(paths.runnerTemp)).map(value => [value.path, `${value.size}:${value.mtimeMs}`])
+    baselineScan.files.map(value => [value.path, `${value.size}:${value.mtimeMs}`])
   )
   const sample = async () => {
     if (sampling) return
@@ -477,14 +606,18 @@ export async function withObjectsResourceSampler<T>(
         }
       }
       const staged = await cacheArchiveFiles(paths.runnerTemp)
-      for (const candidate of staged) {
+      if (!staged.complete) {
+        archive.scanComplete = false
+        archive.scanIncompleteReason ??= staged.incompleteReason ?? 'runner-temp-scan-incomplete'
+      }
+      for (const candidate of staged.files) {
         if (baseline.get(candidate.path) === `${candidate.size}:${candidate.mtimeMs}`) continue
         archive.observed = true
         archive.samples++
-        const apparent = BigInt(archive.peakApparentBytes ?? '0')
-        const allocated = BigInt(archive.peakAllocatedBytes ?? '0')
-        if (candidate.size > apparent) archive.peakApparentBytes = candidate.size.toString()
-        if (candidate.allocated > allocated) archive.peakAllocatedBytes = candidate.allocated.toString()
+        const apparent = BigInt(archive.maxObservedApparentBytes ?? '0')
+        const allocated = BigInt(archive.maxObservedAllocatedBytes ?? '0')
+        if (candidate.size > apparent) archive.maxObservedApparentBytes = candidate.size.toString()
+        if (candidate.allocated > allocated) archive.maxObservedAllocatedBytes = candidate.allocated.toString()
       }
     } finally {
       sampling = false
@@ -513,7 +646,7 @@ export async function withObjectsResourceSampler<T>(
         cacheArchiveStaging: archive,
         mbxExportStagingNote:
           phase === 'bundle-export'
-            ? 'MBX writes a sibling temporary tree and atomically publishes it as bundle; bundle bytes below measure the published same tree, while statfs minima measure peak mount pressure'
+            ? 'MBX writes a sibling temporary tree and atomically publishes it as bundle; bundle bytes below measure the published same tree, while statfs records the lowest available bytes and inodes observed at sampling intervals, not instantaneous peak pressure'
             : undefined,
         cacheArchiveNote: archive.observed
           ? 'local actions/cache archive observed separately from saveCache result'
@@ -532,6 +665,8 @@ export type CacheSaveFailure =
   | 'local-storage'
   | 'unknown'
 
+// Classify only terminal @actions/cache workflow output. Its intermediate SDK
+// warnings and Twirp retry lines can report a failure that later succeeds.
 export function classifyCacheSaveFailure(output: string): CacheSaveFailure {
   if (/\b(?:ENOSPC|no space left on device|disk quota exceeded)\b/i.test(output)) {
     return 'local-storage'
@@ -540,7 +675,13 @@ export function classifyCacheSaveFailure(output: string): CacheSaveFailure {
     /::warning::Failed to save: (?:reserveCache|uploadChunk \([^)]*\)|commitCache) failed: Cache service responded with 5\d\d/i.test(
       output
     ) ||
-    /::warning::Failed to save: Failed to FinalizeCacheEntryUpload:[^\n]*Failed request: \(5\d\d\)/i.test(
+    /::error::Failed to save: (?:reserveCache|uploadChunk \([^)]*\)|commitCache) failed: Cache service responded with 5\d\d/i.test(
+      output
+    ) ||
+    /::(?:warning|error)::Failed to save: Failed to FinalizeCacheEntryUpload:[^\n]*Failed request: \(5\d\d\)/i.test(
+      output
+    ) ||
+    /::(?:warning|error)::Failed to save: uploadCacheArchiveSDK: upload failed with status code 5\d\d\r?\n/i.test(
       output
     )
   ) {
@@ -554,10 +695,13 @@ export function classifyCacheSaveFailure(output: string): CacheSaveFailure {
     return 'service-reservation'
   }
   if (
-    /::warning::Failed to save: (?:reserveCache|uploadChunk \([^)]*\)|commitCache) failed:[^\n]*(?:Request timeout|\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH)\b)/i.test(
+    /::(?:warning|error)::Failed to save: (?:reserveCache|uploadChunk \([^)]*\)|commitCache) failed:[^\n]*(?:Request timeout|\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH)\b)/i.test(
       output
     ) ||
-    /::warning::Failed to save: Failed to FinalizeCacheEntryUpload:[^\n]*(?:Request timeout|\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH)\b)/i.test(
+    /::(?:warning|error)::Failed to save: Failed to FinalizeCacheEntryUpload:[^\n]*(?:Request timeout|\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH)\b)/i.test(
+      output
+    ) ||
+    /::(?:warning|error)::Failed to save:[^\n]*(?:Request timeout|\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH)\b)/i.test(
       output
     )
   ) {

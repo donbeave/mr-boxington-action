@@ -49,11 +49,13 @@ import {
 } from './lib.js'
 import {
   assertObjectsBundleAbsent,
+  assertIsolatedObjectsActionStore,
   createObjectsCachePaths,
   importObjectsBundle,
   pathsFromObjectsCacheRoot,
   reportObjectsResourcePhase,
   saveIsolatedObjectsBundle,
+  withIsolatedObjectsPostCleanup,
   type ObjectsCachePaths
 } from './objects-cache.js'
 import {
@@ -394,9 +396,7 @@ async function main(): Promise<void> {
       core.exportVariable('MBX_CACHE_DIR', isolatedObjectsPaths.store)
       const isolatedActionStore = path.join(isolatedObjectsPaths.store, 'actions')
       const resolvedActionStore = await capture(installed.bin, ['cache', 'dir'])
-      if (path.resolve(resolvedActionStore) !== isolatedActionStore) {
-        throw new Error('mbx did not resolve MBX_CACHE_DIR to the private action store')
-      }
+      assertIsolatedObjectsActionStore(isolatedObjectsPaths, resolvedActionStore)
       await mkdir(isolatedActionStore, {recursive: true})
       cacheArchive = isolatedObjectsPaths.bundle
     } else {
@@ -602,41 +602,51 @@ async function post(): Promise<void> {
     const runnerTemp = process.env.RUNNER_TEMP
     if (!runnerTemp) throw new Error('RUNNER_TEMP is required by isolate-objects-cache post step')
     const isolatedPaths = await pathsFromObjectsCacheRoot(runnerTemp, isolationRoot, form)
-    if (core.getState(CACHE_ARCHIVE_STATE) !== isolatedPaths.bundle) {
-      throw new Error('isolated objects cache bundle path does not match action state')
-    }
-    const primaryKey = core.getState(CACHE_KEY_STATE)
-    if (!primaryKey) throw new Error('isolated objects cache is missing its primary key')
-    const cargoWorkspace = core.getState(CARGO_WORKSPACE_STATE) || process.cwd()
-    const targetDirectory = path.join(cargoWorkspace, 'target')
-    const result = await saveIsolatedObjectsBundle({
-      paths: isolatedPaths,
-      primaryKey,
-      saveEligible: postState === 'github-save',
-      exactHit: core.getState(CACHE_HIT_STATE) === 'true',
-      cargoTarget: targetDirectory,
-      exportBundle: async bundlePath => {
-        const group = core.getState(CACHE_EXPORT_GROUP_STATE)
-        if (!group) throw new Error('isolated objects cache is missing its export group')
-        const exportArgs =
-          form === 'directory'
-            ? ['cache', 'export', '--group', group, '--format', 'directory', bundlePath]
-            : ['cache', 'export', '--group', group, bundlePath]
-        let output = ''
-        const exitCode = await exec.exec(core.getState(MBX_STATE), exportArgs, {
-          ignoreReturnCode: true,
-          listeners: {
-            stdout: data => (output += data.toString()),
-            stderr: data => (output += data.toString())
-          }
+    const result = await withIsolatedObjectsPostCleanup(
+      isolatedPaths,
+      async () => {
+        if (core.getState(CACHE_ARCHIVE_STATE) !== isolatedPaths.bundle) {
+          throw new Error('isolated objects cache bundle path does not match action state')
+        }
+        const primaryKey = core.getState(CACHE_KEY_STATE)
+        if (!primaryKey) throw new Error('isolated objects cache is missing its primary key')
+        const cargoWorkspace = core.getState(CARGO_WORKSPACE_STATE) || process.cwd()
+        const targetDirectory = path.join(cargoWorkspace, 'target')
+        return saveIsolatedObjectsBundle({
+          paths: isolatedPaths,
+          primaryKey,
+          saveEligible: postState === 'github-save',
+          exactHit: core.getState(CACHE_HIT_STATE) === 'true',
+          cargoTarget: targetDirectory,
+          exportBundle: async bundlePath => {
+            const mbx = core.getState(MBX_STATE)
+            if (!mbx) throw new Error('isolated objects cache is missing its mbx executable')
+            const resolvedActionStore = await capture(mbx, ['cache', 'dir'])
+            assertIsolatedObjectsActionStore(isolatedPaths, resolvedActionStore)
+            const group = core.getState(CACHE_EXPORT_GROUP_STATE)
+            if (!group) throw new Error('isolated objects cache is missing its export group')
+            const exportArgs =
+              form === 'directory'
+                ? ['cache', 'export', '--group', group, '--format', 'directory', bundlePath]
+                : ['cache', 'export', '--group', group, bundlePath]
+            let output = ''
+            const exitCode = await exec.exec(mbx, exportArgs, {
+              ignoreReturnCode: true,
+              listeners: {
+                stdout: data => (output += data.toString()),
+                stderr: data => (output += data.toString())
+              }
+            })
+            return {exitCode, output}
+          },
+          isEmptyExport,
+          saveCache: (paths, key) => cache.saveCache(paths, key),
+          emit: message => core.info(message),
+          warn: message => core.warning(message)
         })
-        return {exitCode, output}
       },
-      isEmptyExport,
-      saveCache: (paths, key) => cache.saveCache(paths, key),
-      emit: message => core.info(message),
-      warn: message => core.warning(message)
-    })
+      message => core.warning(message)
+    )
     if (result === 'exact-hit') {
       core.info(`Exact cache ${core.getState(CACHE_KEY_STATE)} already exists; not saving it again`)
     }

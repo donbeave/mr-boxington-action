@@ -7,14 +7,19 @@ import {CompressionMethod} from '../node_modules/@actions/cache/lib/internal/con
 import {afterEach, describe, expect, it} from 'vitest'
 import {generatedKey, primaryCacheKey} from '../src/lib.js'
 import {
+  assertIsolatedObjectsActionStore,
   assertObjectsBundleAbsent,
   classifyCacheSaveFailure,
   createObjectsCachePaths,
   importObjectsBundle,
+  measureTree,
   pathsFromObjectsCacheRoot,
+  reportObjectsResourcePhase,
   saveIsolatedObjectsBundle,
+  withIsolatedObjectsPostCleanup,
   validateObjectsBundle,
-  validateObjectsCachePaths
+  validateObjectsCachePaths,
+  withBoundedActionOutput
 } from '../src/objects-cache.js'
 
 const temporaryRoots: string[] = []
@@ -52,6 +57,10 @@ describe('isolated objects cache paths', () => {
     expect(secondPaths.bundle).toBe(paths.bundle)
     expect(await pathExists(paths.store)).toBe(true)
     await expect(assertObjectsBundleAbsent(paths)).resolves.toBeUndefined()
+    expect(() => assertIsolatedObjectsActionStore(paths, path.join(paths.store, 'actions'))).not.toThrow()
+    expect(() => assertIsolatedObjectsActionStore(paths, path.join(runnerTemp, 'shared', 'actions'))).toThrow(
+      /outside the private isolated cache store/
+    )
   })
 
   it('keeps the cache archive version shared when primary suffixes differ', async () => {
@@ -96,6 +105,103 @@ describe('isolated objects cache paths', () => {
       await symlink(runnerTemp, path.join(paths.bundle, 'escape'), 'dir')
       await expect(validateObjectsBundle(paths)).rejects.toThrow(/contains a symlink/)
     }
+  })
+
+  it('caps wide tree walks while streaming entries and fails closed for bundle validation', async () => {
+    const runnerTemp = await makeTemp()
+    const tree = path.join(runnerTemp, 'wide-tree')
+    await mkdir(tree)
+    await Promise.all(
+      Array.from({length: 5}, (_, index) => writeFile(path.join(tree, `entry-${index}`), 'x'))
+    )
+    const measured = await measureTree(tree, false, 3)
+    expect(measured.complete).toBe(false)
+    expect(measured.entriesScanned).toBeLessThanOrEqual(3)
+    await expect(measureTree(tree, true, 3)).rejects.toThrow(/exceeds the 3 entry validation limit/)
+  })
+
+  it('measures a symlinked Cargo target through its real directory', async () => {
+    if (process.platform === 'win32') return
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const actualTarget = path.join(runnerTemp, 'actual-target')
+    const cargoTarget = path.join(runnerTemp, 'workspace-target')
+    await mkdir(actualTarget)
+    await writeFile(path.join(actualTarget, 'fingerprint'), 'target-data')
+    await symlink(actualTarget, cargoTarget, 'dir')
+    const events: string[] = []
+    const cargo = await reportObjectsResourcePhase(paths, 'symlink-target-test', cargoTarget, event => {
+      events.push(event)
+    })
+    expect(cargo?.files).toBe(1)
+    expect(cargo?.apparentBytes).toBe(String(Buffer.byteLength('target-data')))
+    expect(events[0]).toContain('"phase":"symlink-target-test"')
+  })
+
+  it('cleans the validated private root after successful and failed post operations', async () => {
+    const runnerTemp = await makeTemp()
+    const successPaths = await createObjectsCachePaths(runnerTemp, 'directory')
+    await mkdir(path.join(successPaths.store, 'actions'), {recursive: true})
+    await writeFile(path.join(successPaths.store, 'actions', 'store-object'), 'store')
+    await mkdir(successPaths.bundle)
+    await writeFile(path.join(successPaths.bundle, 'manifest.json'), '{}')
+    const order: string[] = []
+    const result = await withIsolatedObjectsPostCleanup(
+      successPaths,
+      async () => {
+        order.push('post-operation')
+        expect(await pathExists(successPaths.store)).toBe(true)
+        expect(await pathExists(successPaths.bundle)).toBe(true)
+        return 'saved'
+      },
+      () => order.push('warning')
+    )
+    order.push('post-cleanup')
+    expect(result).toBe('saved')
+    expect(order).toEqual(['post-operation', 'post-cleanup'])
+    expect(await pathExists(successPaths.root)).toBe(false)
+    expect(await pathExists(successPaths.store)).toBe(false)
+    expect(await pathExists(successPaths.bundle)).toBe(false)
+
+    const failurePaths = await createObjectsCachePaths(runnerTemp, 'directory')
+    await mkdir(path.join(failurePaths.store, 'actions'), {recursive: true})
+    await mkdir(failurePaths.bundle)
+    await writeFile(path.join(failurePaths.bundle, 'partial'), 'export')
+    const primaryError = new Error('actions/cache local staging failed')
+    await expect(
+      withIsolatedObjectsPostCleanup(
+        failurePaths,
+        async () => {
+          throw primaryError
+        },
+        () => {}
+      )
+    ).rejects.toBe(primaryError)
+    expect(await pathExists(failurePaths.root)).toBe(false)
+    expect(await pathExists(failurePaths.bundle)).toBe(false)
+  })
+
+  it('preserves the post failure when unsafe paths prevent cleanup', async () => {
+    if (process.platform === 'win32') return
+    const runnerTemp = await makeTemp()
+    const paths = await createObjectsCachePaths(runnerTemp, 'directory')
+    const outside = path.join(runnerTemp, 'outside')
+    await mkdir(outside)
+    await symlink(outside, paths.bundle, 'dir')
+    const primaryError = new Error('export validation failed')
+    const warnings: string[] = []
+    await expect(
+      withIsolatedObjectsPostCleanup(
+        paths,
+        async () => {
+          throw primaryError
+        },
+        message => warnings.push(message)
+      )
+    ).rejects.toBe(primaryError)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/Could not remove isolated mbx cache after post failure/)
+    expect(await pathExists(paths.root)).toBe(true)
   })
 
   it('imports a valid bundle and removes it only after import succeeds', async () => {
@@ -161,7 +267,7 @@ describe('isolated objects bundle save lifecycle', () => {
           expect(key).toBe('generated-key')
           expect(cachePaths).toEqual([paths.bundle])
           expect(await pathExists(paths.store)).toBe(false)
-          process.stdout.write('::notice::Cache saved successfully\n')
+          core.info('Cache saved successfully')
           return 17
         },
         emit: message => events.push(message),
@@ -177,6 +283,8 @@ describe('isolated objects bundle save lifecycle', () => {
       expect(events.some(event => event.includes('actions-cache-save'))).toBe(true)
       expect(events.some(event => event.includes('after-cache-save'))).toBe(true)
       expect(events.some(event => event.includes('bundleApparentBytes'))).toBe(true)
+      expect(events.some(event => event.includes('not instantaneous peak pressure'))).toBe(true)
+      expect(events.some(event => event.includes('maxObservedIntervalMs'))).toBe(true)
     } finally {
       if (originalMode === undefined) delete process.env.ACTIONS_CACHE_SERVICE_V2
       else process.env.ACTIONS_CACHE_SERVICE_V2 = originalMode
@@ -278,7 +386,7 @@ describe('isolated objects bundle save lifecycle', () => {
         },
         isEmptyExport: () => false,
         saveCache: async () => {
-          process.stdout.write('::warning::Failed to save: tar failed: No space left on device (os error 28)\n')
+          core.warning('Failed to save: tar failed: No space left on device (os error 28)')
           return -1
         },
         emit: () => {},
@@ -321,16 +429,98 @@ describe('isolated objects bundle save lifecycle', () => {
   })
 
   it('fails closed for unknown save results and ENOSPC, but warns on terminal transport failures', async () => {
-    expect(
-      classifyCacheSaveFailure(
-        '::warning::Failed to save: commitCache failed: Cache service responded with 503'
+    const captureWarning = async (message: string) =>
+      (await withBoundedActionOutput(async () => core.warning(message))).output
+    const captureError = async (message: string) =>
+      (await withBoundedActionOutput(async () => core.error(message))).output
+    const v1CommitFailure = await captureWarning(
+      'Failed to save: commitCache failed: Cache service responded with 503'
+    )
+    expect(v1CommitFailure).toBe(
+      '::warning::Failed to save: commitCache failed: Cache service responded with 503\n'
+    )
+    expect(classifyCacheSaveFailure(v1CommitFailure)).toBe('service-5xx')
+
+    const v2FinalizeFailure = await captureWarning(
+      'Failed to save: Failed to FinalizeCacheEntryUpload: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable'
+    )
+    expect(v2FinalizeFailure).toBe(
+      '::warning::Failed to save: Failed to FinalizeCacheEntryUpload: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable\n'
+    )
+    expect(classifyCacheSaveFailure(v2FinalizeFailure)).toBe('service-5xx')
+
+    const v2FinalizeHttpError = await captureError(
+      'Failed to save: Failed to FinalizeCacheEntryUpload: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable'
+    )
+    expect(v2FinalizeHttpError).toBe(
+      '::error::Failed to save: Failed to FinalizeCacheEntryUpload: Failed to make request after 5 attempts: Failed request: (503) Service Unavailable\n'
+    )
+    expect(classifyCacheSaveFailure(v2FinalizeHttpError)).toBe('service-5xx')
+
+    const uploadStatusFailure = (
+      await withBoundedActionOutput(async () => {
+        core.warning(
+          'uploadCacheArchiveSDK: internal error uploading cache archive: uploadCacheArchiveSDK: upload failed with status code 503'
+        )
+        core.warning('Failed to save: uploadCacheArchiveSDK: upload failed with status code 503')
+      })
+    ).output
+    expect(uploadStatusFailure).toBe(
+      '::warning::uploadCacheArchiveSDK: internal error uploading cache archive: uploadCacheArchiveSDK: upload failed with status code 503\n' +
+        '::warning::Failed to save: uploadCacheArchiveSDK: upload failed with status code 503\n'
+    )
+    expect(classifyCacheSaveFailure(uploadStatusFailure)).toBe('service-5xx')
+    const uploadStatusAttemptOnly = await captureWarning(
+      'uploadCacheArchiveSDK: internal error uploading cache archive: uploadCacheArchiveSDK: upload failed with status code 503'
+    )
+    expect(classifyCacheSaveFailure(uploadStatusAttemptOnly)).toBe('unknown')
+
+    const uploadStatusHttpError = await captureError(
+      'Failed to save: uploadCacheArchiveSDK: upload failed with status code 503'
+    )
+    expect(classifyCacheSaveFailure(uploadStatusHttpError)).toBe('service-5xx')
+
+    const v2FinalizeTransport = await captureWarning(
+      'Failed to save: Failed to FinalizeCacheEntryUpload: Unable to make request: ETIMEDOUT\n' +
+        'If you are using self-hosted runners, please make sure your runner has access to all GitHub endpoints: https://docs.github.com/en/actions/hosting-your-own-runners/managing-your-own-runners#communication-between-self-hosted-runners-and-github'
+    )
+    expect(v2FinalizeTransport).toContain(
+      '::warning::Failed to save: Failed to FinalizeCacheEntryUpload: Unable to make request: ETIMEDOUT%0A'
+    )
+    expect(classifyCacheSaveFailure(v2FinalizeTransport)).toBe('network-transport')
+
+    const uploadTransport = (
+      await withBoundedActionOutput(async () => {
+        core.warning(
+          'uploadCacheArchiveSDK: internal error uploading cache archive: RestError: connect ETIMEDOUT 10.0.0.1:443'
+        )
+        core.warning('Failed to save: RestError: connect ETIMEDOUT 10.0.0.1:443')
+      })
+    ).output
+    expect(uploadTransport).toContain(
+      '::warning::uploadCacheArchiveSDK: internal error uploading cache archive: RestError: connect ETIMEDOUT 10.0.0.1:443\n'
+    )
+    expect(uploadTransport).toContain(
+      '::warning::Failed to save: RestError: connect ETIMEDOUT 10.0.0.1:443\n'
+    )
+    expect(classifyCacheSaveFailure(uploadTransport)).toBe('network-transport')
+    const uploadTransportHttpError = await captureError(
+      'Failed to save: RestError: connect ETIMEDOUT 10.0.0.1:443'
+    )
+    expect(classifyCacheSaveFailure(uploadTransportHttpError)).toBe('network-transport')
+    const uploadTransportAttemptOnly = await captureWarning(
+      'uploadCacheArchiveSDK: internal error uploading cache archive: RestError: connect ETIMEDOUT 10.0.0.1:443'
+    )
+    expect(classifyCacheSaveFailure(uploadTransportAttemptOnly)).toBe('unknown')
+
+    const v2Retry = (
+      await withBoundedActionOutput(async () =>
+        core.info(
+          'Attempt 1 of 5 failed with error: Failed request: (503) Service Unavailable. Retrying request in 3456 ms...'
+        )
       )
-    ).toBe('service-5xx')
-    expect(
-      classifyCacheSaveFailure(
-        '::warning::Failed to save: Failed to FinalizeCacheEntryUpload: Unable to make request: ETIMEDOUT'
-      )
-    ).toBe('network-transport')
+    ).output
+    expect(classifyCacheSaveFailure(v2Retry)).toBe('unknown')
     expect(
       classifyCacheSaveFailure(
         'Failed to save: Unable to reserve cache with key key, another job may be creating this cache.\n'
@@ -346,17 +536,19 @@ describe('isolated objects bundle save lifecycle', () => {
     )
     expect(
       classifyCacheSaveFailure(
+        '::warning::uploadCacheArchiveSDK: internal error uploading cache archive: write failed: ENOSPC\n' +
+          '::warning::Failed to save: uploadCacheArchiveSDK: internal error uploading cache archive: write failed: ENOSPC\n'
+      )
+    ).toBe('local-storage')
+    expect(
+      classifyCacheSaveFailure(
         'Failed to save: Unable to reserve cache with key X, another job may be creating this cache\n'
       )
     ).toBe('unknown')
-    expect(
-      classifyCacheSaveFailure('::debug::Attempt 1 of 5 failed with error: HTTP 503; retrying')
-    ).toBe('unknown')
-    expect(
-      classifyCacheSaveFailure(
-        '::warning::Failed to save: Unable to reserve cache with key key. More details: cache write denied: read only'
-      )
-    ).toBe('unknown')
+    const policyDenial = await captureWarning(
+      'Failed to save: Unable to reserve cache with key key. More details: cache write denied: read only'
+    )
+    expect(classifyCacheSaveFailure(policyDenial)).toBe('unknown')
   })
 
   it('accepts V2 save IDs only with the V2 service and fails closed on V1 reservation IDs', async () => {
