@@ -46,6 +46,7 @@ export interface ResourcePhase {
 
 const MAX_TREE_ENTRIES = 1_000_000
 const SAMPLER_INTERVAL_MS = 250
+const MAX_RECORDED_SAMPLE_FAILURES = 1_000
 const MISSING = Symbol('missing')
 
 function bundleName(form: ObjectsBundleForm): string {
@@ -56,6 +57,19 @@ function errorCode(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error
     ? String((error as NodeJS.ErrnoException).code)
     : undefined
+}
+
+function sampleFailureReason(error: unknown): string {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) return 'unknown'
+  try {
+    const code = (error as {code?: unknown}).code
+    if (typeof code === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(code)) return `code:${code}`
+    const name = (error as {name?: unknown}).name
+    if (typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(name)) return `type:${name}`
+  } catch {
+    // Diagnostic failures must never become action failures.
+  }
+  return 'unknown'
 }
 
 async function maybeLstat(value: string) {
@@ -523,14 +537,14 @@ export interface SampledArchiveUsage {
   scanIncompleteReason: string | null
 }
 
-interface CacheArchiveFile {
+export interface CacheArchiveFile {
   path: string
   size: bigint
   allocated: bigint
   mtimeMs: number
 }
 
-interface CacheArchiveScan {
+export interface CacheArchiveScan {
   files: CacheArchiveFile[]
   complete: boolean
   incompleteReason?: string
@@ -556,7 +570,7 @@ async function cacheArchiveFiles(runnerTemp: string): Promise<CacheArchiveScan> 
       const folder = path.join(runnerTemp, child.name)
       const folderStat = await maybeLstat(folder)
       if (folderStat === MISSING || !folderStat.isDirectory() || folderStat.isSymbolicLink()) continue
-      for (const name of ['cache.tgz', 'cache.tzst']) {
+      for (const name of ['cache.tgz', 'cache.tzst', 'cache.tar']) {
         const file = path.join(folder, name)
         const info = await maybeLstat(file)
         if (info !== MISSING && info.isFile()) {
@@ -578,15 +592,39 @@ async function cacheArchiveFiles(runnerTemp: string): Promise<CacheArchiveScan> 
   return {files: archives, complete: true}
 }
 
+export interface ObjectsResourceSamplerDependencies {
+  mountUsages?: (paths: ObjectsCachePaths, cargoTarget: string) => Promise<MountUsage[]>
+  cacheArchiveFiles?: (runnerTemp: string) => Promise<CacheArchiveScan>
+  intervalMs?: number
+}
+
 export async function withObjectsResourceSampler<T>(
   paths: ObjectsCachePaths,
   cargoTarget: string,
   phase: string,
   operation: () => Promise<T>,
-  emit: (message: string) => void
+  emit: (message: string) => void,
+  dependencies: ObjectsResourceSamplerDependencies = {}
 ): Promise<{result: T; archives: SampledArchiveUsage}> {
   const minima = new Map<string, MountUsage>()
-  const baselineScan = await cacheArchiveFiles(paths.runnerTemp)
+  const readMountUsages = dependencies.mountUsages ?? mountUsages
+  const scanArchives = dependencies.cacheArchiveFiles ?? cacheArchiveFiles
+  const sampleIntervalMs = dependencies.intervalMs ?? SAMPLER_INTERVAL_MS
+  let sampleFailureCount = 0
+  let sampleFailureCountCapped = false
+  let firstSampleFailureReason: string | null = null
+  const recordSampleFailure = (error: unknown) => {
+    if (sampleFailureCount < MAX_RECORDED_SAMPLE_FAILURES) sampleFailureCount++
+    else sampleFailureCountCapped = true
+    firstSampleFailureReason ??= sampleFailureReason(error)
+  }
+  let baselineScan: CacheArchiveScan
+  try {
+    baselineScan = await scanArchives(paths.runnerTemp)
+  } catch (error) {
+    recordSampleFailure(error)
+    baselineScan = {files: [], complete: false, incompleteReason: 'baseline-scan-failed'}
+  }
   const archive: SampledArchiveUsage = {
     observed: false,
     samples: 0,
@@ -596,7 +634,7 @@ export async function withObjectsResourceSampler<T>(
     scanLimit: MAX_TREE_ENTRIES,
     scanIncompleteReason: baselineScan.incompleteReason ?? null
   }
-  let sampling = false
+  let inFlightSample: Promise<void> | undefined
   let sampleCount = 0
   const startTime = Date.now()
   let previousSampleAt: number | undefined
@@ -605,16 +643,15 @@ export async function withObjectsResourceSampler<T>(
     baselineScan.files.map(value => [value.path, `${value.size}:${value.mtimeMs}`])
   )
   const sample = async () => {
-    if (sampling) return
-    sampling = true
-    try {
+    if (inFlightSample) return inFlightSample
+    const pending = (async () => {
       sampleCount++
       const sampledAt = Date.now()
       if (previousSampleAt !== undefined) {
         maxObservedIntervalMs = Math.max(maxObservedIntervalMs, sampledAt - previousSampleAt)
       }
       previousSampleAt = sampledAt
-      for (const usage of await mountUsages(paths, cargoTarget)) {
+      for (const usage of await readMountUsages(paths, cargoTarget)) {
         const current = minima.get(usage.identity)
         if (!current) minima.set(usage.identity, {...usage, roles: [...usage.roles]})
         else {
@@ -623,7 +660,7 @@ export async function withObjectsResourceSampler<T>(
           if (BigInt(usage.freeInodes) < BigInt(current.freeInodes)) current.freeInodes = usage.freeInodes
         }
       }
-      const staged = await cacheArchiveFiles(paths.runnerTemp)
+      const staged = await scanArchives(paths.runnerTemp)
       if (!staged.complete) {
         archive.scanComplete = false
         archive.scanIncompleteReason ??= staged.incompleteReason ?? 'runner-temp-scan-incomplete'
@@ -637,42 +674,71 @@ export async function withObjectsResourceSampler<T>(
         if (candidate.size > apparent) archive.maxObservedApparentBytes = candidate.size.toString()
         if (candidate.allocated > allocated) archive.maxObservedAllocatedBytes = candidate.allocated.toString()
       }
+    })()
+    const handled = pending.catch(error => {
+      recordSampleFailure(error)
+      archive.scanComplete = false
+      archive.scanIncompleteReason ??= 'resource-sample-failed'
+    })
+    inFlightSample = handled
+    try {
+      await handled
     } finally {
-      sampling = false
+      if (inFlightSample === handled) inFlightSample = undefined
     }
   }
   await sample()
-  const timer = setInterval(() => void sample(), SAMPLER_INTERVAL_MS)
+  const timer = setInterval(() => {
+    if (!inFlightSample) void sample()
+  }, sampleIntervalMs)
   let result!: T
   let thrown: unknown
+  let operationThrew = false
   try {
     result = await operation()
   } catch (error) {
+    operationThrew = true
     thrown = error
   } finally {
     clearInterval(timer)
+    if (inFlightSample) {
+      try {
+        await inFlightSample
+      } catch (error) {
+        recordSampleFailure(error)
+      }
+    }
     await sample()
-    emit(
-      `Objects cache sample ${JSON.stringify({
-        schema: 1,
-        phase,
-        sampleIntervalMs: SAMPLER_INTERVAL_MS,
-        maxObservedIntervalMs,
-        durationMs: Date.now() - startTime,
-        sampleCount,
-        mounts: [...minima.values()],
-        cacheArchiveStaging: archive,
-        mbxExportStagingNote:
-          phase === 'bundle-export'
-            ? 'MBX writes a sibling temporary tree and atomically publishes it as bundle; bundle bytes below measure the published same tree, while statfs records the lowest available bytes and inodes observed at sampling intervals, not instantaneous peak pressure'
-            : undefined,
-        cacheArchiveNote: archive.observed
-          ? 'local actions/cache archive observed separately from saveCache result'
-          : 'actions/cache archive was not observed during sampling; no upload size inferred'
-      })}`
-    )
+    try {
+      emit(
+        `Objects cache sample ${JSON.stringify({
+          schema: 1,
+          phase,
+          sampleIntervalMs,
+          maxObservedIntervalMs,
+          durationMs: Date.now() - startTime,
+          sampleCount,
+          samplingFailures: {
+            count: sampleFailureCount,
+            countCapped: sampleFailureCountCapped,
+            firstReason: firstSampleFailureReason
+          },
+          mounts: [...minima.values()],
+          cacheArchiveStaging: archive,
+          mbxExportStagingNote:
+            phase === 'bundle-export'
+              ? 'MBX writes a sibling temporary tree and atomically publishes it as bundle; bundle bytes below measure the published same tree, while statfs records the lowest available bytes and inodes observed at sampling intervals, not instantaneous peak pressure'
+              : undefined,
+          cacheArchiveNote: archive.observed
+            ? 'local actions/cache archive observed separately from saveCache result'
+            : 'actions/cache archive was not observed during sampling; no upload size inferred'
+        })}`
+      )
+    } catch {
+      // Resource telemetry must not replace the operation result or error.
+    }
   }
-  if (thrown !== undefined) throw thrown
+  if (operationThrew) throw thrown
   return {result, archives: archive}
 }
 
