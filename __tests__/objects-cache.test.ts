@@ -395,6 +395,61 @@ describe('isolated objects bundle save lifecycle', () => {
     expect(await pathExists(paths.bundle)).toBe(false)
   })
 
+  it('warns and continues on the V2 terminal finalization contention result', async () => {
+    const {paths, cargoTarget} = await setup()
+    const warnings: string[] = []
+    const result = await saveIsolatedObjectsBundle({
+      paths,
+      primaryKey: 'generated-key',
+      saveEligible: true,
+      exactHit: false,
+      cargoTarget,
+      exportBundle: async bundle => {
+        await mkdir(bundle)
+        await writeFile(path.join(bundle, 'manifest.json'), '{}')
+        return {exitCode: 0, output: ''}
+      },
+      isEmptyExport: () => false,
+      saveCache: async () => {
+        core.warning(
+          'Failed to save: Unable to finalize cache with key generated-key, another job may be finalizing this cache.'
+        )
+        return 17
+      },
+      emit: () => {},
+      warn: message => warnings.push(message)
+    })
+    expect(result).toBe('save-unavailable')
+    expect(warnings).toEqual(['GitHub cache save skipped after classified service-reservation'])
+    expect(await pathExists(paths.bundle)).toBe(false)
+  })
+
+  it('keeps an intermediate SDK ENOSPC warning nonfatal after a successful save', async () => {
+    const {paths, cargoTarget} = await setup()
+    const result = await saveIsolatedObjectsBundle({
+      paths,
+      primaryKey: 'generated-key',
+      saveEligible: true,
+      exactHit: false,
+      cargoTarget,
+      exportBundle: async bundle => {
+        await mkdir(bundle)
+        await writeFile(path.join(bundle, 'manifest.json'), '{}')
+        return {exitCode: 0, output: ''}
+      },
+      isEmptyExport: () => false,
+      saveCache: async () => {
+        core.warning('uploadCacheArchiveSDK: internal error uploading cache archive: ENOSPC')
+        core.info('Cache saved successfully')
+        return 17
+      },
+      emit: () => {},
+      warn: () => {}
+    })
+    expect(result).toBe('saved')
+    expect(await pathExists(paths.bundle)).toBe(false)
+  })
+
   it('fails on ENOSPC from local actions/cache staging', async () => {
     const {paths, cargoTarget} = await setup()
     await expect(
@@ -419,6 +474,32 @@ describe('isolated objects bundle save lifecycle', () => {
       })
     ).rejects.toThrow(/runner storage is full/)
     expect(await pathExists(paths.store)).toBe(false)
+    expect(await pathExists(paths.bundle)).toBe(true)
+  })
+
+  it('keeps a structured ENOSPC save error hard without relying on logged text', async () => {
+    const {paths, cargoTarget} = await setup()
+    const noSpaceError = Object.assign(new Error('archive staging failed'), {code: 'ENOSPC'})
+    await expect(
+      saveIsolatedObjectsBundle({
+        paths,
+        primaryKey: 'generated-key',
+        saveEligible: true,
+        exactHit: false,
+        cargoTarget,
+        exportBundle: async bundle => {
+          await mkdir(bundle)
+          await writeFile(path.join(bundle, 'manifest.json'), '{}')
+          return {exitCode: 0, output: ''}
+        },
+        isEmptyExport: () => false,
+        saveCache: async () => {
+          throw noSpaceError
+        },
+        emit: () => {},
+        warn: () => {}
+      })
+    ).rejects.toBe(noSpaceError)
     expect(await pathExists(paths.bundle)).toBe(true)
   })
 
@@ -556,15 +637,22 @@ describe('isolated objects bundle save lifecycle', () => {
         'Failed to save: Unable to reserve cache with key key, another job may be creating this cache. More details: already reserved\n'
       )
     ).toBe('service-reservation')
-    expect(classifyCacheSaveFailure('::warning::Failed to save: tar failed: ENOSPC')).toBe(
-      'local-storage'
+    const v2FinalizeContention = await captureWarning(
+      'Failed to save: Unable to finalize cache with key generated-key, another job may be finalizing this cache.'
     )
-    expect(
-      classifyCacheSaveFailure(
-        '::warning::uploadCacheArchiveSDK: internal error uploading cache archive: write failed: ENOSPC\n' +
-          '::warning::Failed to save: uploadCacheArchiveSDK: internal error uploading cache archive: write failed: ENOSPC\n'
-      )
-    ).toBe('local-storage')
+    expect(v2FinalizeContention).toBe(
+      '::warning::Failed to save: Unable to finalize cache with key generated-key, another job may be finalizing this cache.\n'
+    )
+    expect(classifyCacheSaveFailure(v2FinalizeContention)).toBe('service-reservation')
+
+    const terminalNoSpace = await captureWarning(
+      'Failed to save: tar failed: No space left on device (os error 28)'
+    )
+    expect(classifyCacheSaveFailure(terminalNoSpace)).toBe('local-storage')
+    const intermediateNoSpace = await captureWarning(
+      'uploadCacheArchiveSDK: internal error uploading cache archive: write failed: ENOSPC'
+    )
+    expect(classifyCacheSaveFailure(intermediateNoSpace)).toBe('unknown')
     expect(
       classifyCacheSaveFailure(
         'Failed to save: Unable to reserve cache with key X, another job may be creating this cache\n'

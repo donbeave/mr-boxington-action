@@ -686,7 +686,11 @@ export type CacheSaveFailure =
 // Classify only terminal @actions/cache workflow output. Its intermediate SDK
 // warnings and Twirp retry lines can report a failure that later succeeds.
 export function classifyCacheSaveFailure(output: string): CacheSaveFailure {
-  if (/\b(?:ENOSPC|no space left on device|disk quota exceeded)\b/i.test(output)) {
+  if (
+    /::(?:warning|error)::Failed to save:[^\n]*\b(?:ENOSPC|no space left on device|disk quota exceeded)\b/i.test(
+      output
+    )
+  ) {
     return 'local-storage'
   }
   if (
@@ -707,6 +711,9 @@ export function classifyCacheSaveFailure(output: string): CacheSaveFailure {
   }
   if (
     /(?:^|\r?\n)Failed to save: Unable to reserve cache with key [^\r\n]*, another job may be creating this cache\.(?: More details: [^\r\n]*)?\r?(?:\n|$)/i.test(
+      output
+    ) ||
+    /::warning::Failed to save: Unable to finalize cache with key [^\r\n]*, another job may be finalizing this cache\.\r?\n/i.test(
       output
     )
   ) {
