@@ -1,329 +1,187 @@
-# mr-boxington-action
+# Mr Boxington
 
-Set up [mr boxington](https://github.com/jdx/mr-boxington) and use its local
-store directly or back it with GitHub Actions cache, an mbx-compatible server, or an S3
-bucket. When
-`version` is omitted, the action uses `mbx` from `PATH` and downloads the latest
-release only when it is absent. Setting `version` always installs that release.
+This action sets up the native `mbx` command for a local or remote cache. An
+optional native snapshot is imported only by a verified MBX binary. The action
+has no GitHub cache writer, cache restore key, or post step.
 
-## Local filesystem
+## Local cache
 
 ```yaml
-steps:
-  - uses: actions/checkout@v7
-  - uses: jdx/mr-boxington-action@v1
-    with:
-      backend: local
-  - run: mbx test --workspace
+- uses: jdx/mr-boxington-action@<full-commit-sha>
+  with:
+    backend: local
 ```
 
-The local backend installs or reuses mbx and leaves its store on the filesystem without
-configuring a remote transport or an upload/download phase. This is useful on
-persistent runners and with volume actions that mount mbx's cache directory.
+The action selects `mbx` from `PATH` or installs a verified immutable release.
+Use `version` to pin a release.
 
-## GitHub Actions cache
+Every actual `uses:` invocation must include the step-level startup environment
+block in the authenticated snapshot example below. This includes local and
+remote setup, release resolution or download, and snapshot reads. The snippets
+in this README abbreviate that repeated block; add it to each action step,
+including the local example above, before use.
+
+## Authenticated native snapshot
+
+The consuming workflow grants `actions: read`, `attestations: read`, and
+`contents: read`, passes a verified MBX binary, and sets
+`snapshot-selection` to `latest-compatible` or `artifact-id`. The optional
+artifact ID is only an untrusted service-record selector. The action passes a
+snapshot read token only to the native importer and exposes a fixed
+comparison-state path under its private MBX store. That file exists only after
+authenticated import; a cold import creates no baseline. A selector grants no
+authority. The selected MBX operation must verify the
+fixed GitHub service response, artifact bytes, signed producer provenance, and
+compiled source profile before importing native data. If the artifact is absent,
+unavailable, or inadmissible, the action continues cold. No source profile,
+workflow identity, or admission boolean is accepted as an action input.
+Native snapshot admission currently requires Unix no-follow directory handles;
+other platforms fail cold while ordinary MBX setup and builds continue.
+This source change alone does not qualify a reader or producer. Native data is
+usable only after the separately compiled MBX source profile and signed
+producer/job provenance have passed their own review.
+
+An authenticated import can leave the current workspace unchanged when MBX
+detects a safe restore condition, such as a nonempty workspace. The action then
+keeps the authenticated comparison state but reports
+`native-snapshot-imported: false`; its run summary distinguishes that outcome
+from a cold miss.
+
+The action starts `node24` before any action code can inspect or scrub its
+environment. GitHub exposes inputs as `INPUT_*` variables at that point; the
+default `snapshot-read-token` is `${{ github.token }}`. A preload or injected
+proxy, CA, loader, or shell setting could act before validation and read that
+token. A prior hardening step cannot secure this startup environment because
+later steps can change it. Blank the following variables on the action step
+itself for every invocation:
 
 ```yaml
 permissions:
+  actions: read
+  attestations: read
   contents: read
-
 steps:
-  - uses: actions/checkout@v7
-  - uses: jdx/mr-boxington-action@v1
-  - run: mbx test --workspace
+  - uses: jdx/mr-boxington-action@<full-commit-sha>
+    env:
+      ALL_PROXY: ''
+      all_proxy: ''
+      FTP_PROXY: ''
+      ftp_proxy: ''
+      HTTP_PROXY: ''
+      http_proxy: ''
+      HTTPS_PROXY: ''
+      https_proxy: ''
+      NO_PROXY: ''
+      no_proxy: ''
+      GLOBAL_AGENT_HTTP_PROXY: ''
+      NPM_CONFIG_HTTPS_PROXY: ''
+      NPM_CONFIG_PROXY: ''
+      npm_config_https_proxy: ''
+      npm_config_proxy: ''
+      CURL_CA_BUNDLE: ''
+      REQUESTS_CA_BUNDLE: ''
+      SSL_CERT_FILE: ''
+      SSL_CERT_DIR: ''
+      NODE_TLS_REJECT_UNAUTHORIZED: ''
+      NODE_EXTRA_CA_CERTS: ''
+      NODE_USE_ENV_PROXY: ''
+      NODE_USE_SYSTEM_CA: ''
+      NODE_OPTIONS: ''
+      NODE_PATH: ''
+      OPENSSL_CONF: ''
+      OPENSSL_MODULES: ''
+      SSLKEYLOGFILE: ''
+      LD_PRELOAD: ''
+      LD_LIBRARY_PATH: ''
+      LD_AUDIT: ''
+      LD_DEBUG: ''
+      DYLD_INSERT_LIBRARIES: ''
+      DYLD_LIBRARY_PATH: ''
+      BASH_ENV: ''
+      ENV: ''
+      TAR_OPTIONS: ''
+    with:
+      backend: local
+      mbx-path: /absolute/path/to/verified/mbx
+      expected-version: 1.12.0
+      expected-binary-sha256: replace-with-source-bound-sha256
+      snapshot-selection: latest-compatible
+      snapshot-read-token: ${{ github.token }}
 ```
 
-The default backend restores Cargo's pruned target directory and registry from
-the previous compatible build on every run, so a job that changes a few files
-recompiles only those crates. It saves a new immutable entry for pushes to the
-repository's default branch. Pull requests and other branches are
-restore-only unless opted in below, and fork pull requests are always
-restore-only.
+Replace the binary path, version, and digest with values from the caller's
+reviewed source-bound descriptor. These variables must be blank on the exact
+`uses:` step; placing them only at job scope or in a prior step is insufficient.
+A Velnor generator integration must bind its callsite to this reviewed
+prelaunch set. This action source alone does not prove the generated workflow
+does so.
 
-The action disables mbx-managed target views and native-link object caching so
-it can transport the in-place `target` tree without also transporting mbx's
-object cache. The post step removes final products and unrelated Cargo state
-before saving, while retaining fingerprints, dependencies, build-script state,
-and the registry. Full mbx executables used by build-script shims, including
-legacy hard-linked copies, are omitted from transport and rehydrated from the
-installed mbx after restore; tiny launchers and Cargo freshness timestamps
-remain intact. When `version` pins an exact release, the archive also carries
-one mbx executable so later warm jobs avoid a separate release download.
+The verified preinstalled MBX path is copied into a private `RUNNER_TEMP`
+directory and checked by version and SHA-256 before use. Snapshot import needs
+`actions: read`, `attestations: read`, and `contents: read`; the token is passed
+only to the native importer. The importer receives the repository selector,
+canonical runner temp, and a fresh empty private MBX store path created by the
+action under runner temp; it starts in `GITHUB_WORKSPACE`. MBX validates that
+store directory before use, and the action exports the same path for later MBX
+steps. It does not use Cargo or MBX store paths from earlier-step environment.
+Ordinary MBX
+and tool children receive a small explicit environment without Actions runtime,
+cache, OIDC, proxy, or GitHub credentials. Toolkit archive extraction runs with
+a system-only search path and a scrubbed environment.
 
-The earlier `objects` payload is still available for workflows whose builds
-must share across differing target directories or checkout layouts:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    github-cache-mode: objects
-- run: mbx test --workspace
-```
-
-That mode imports the restored bundle before any build steps and exports the
-deduplicated closure of every completed `mbx` command in the job afterward,
-assigning a unique `MBX_CACHE_EXPORT_GROUP` automatically. Its entries are
-smaller because they omit the Cargo registry, which Cargo then downloads again
-inside the build; in paired measurements on GitHub-hosted runners it restored
-and built a small edit roughly ten seconds slower than the `target` payload.
-
-For disposable hosted runners, set `isolate-objects-cache: true` to keep the
-live mbx store under `RUNNER_TEMP` and save only the external exported bundle.
-After a valid bundle is exported, the action removes that isolated store before
-`actions/cache` stages its upload archive. Leave this off on persistent runners
-that rely on mbx's native warm store. Use one isolated objects-cache action
-invocation per job; its stable bundle path keeps the cache version shared across
-jobs and runs.
-
-From mbx 1.12.0 the bundle is a directory instead of a tar. `actions/cache`
-archives whatever path it is given, so a tar meant every byte was written twice
-on restore: once when the cache action unpacked its own archive, and again when
-the importer unpacked the tar inside it. The importer now reads the restored
-tree in place. On a warm restore of a 4,071-object closure this took
-`mbx cache import` from 6.5s to 2.0s, against roughly 1.3s more spent inside
-the cache action's own restore, which handles many files less quickly than one
-archive. Earlier mbx versions keep the tar form. The two use separate cache
-keys, so the first job after an mbx version crosses 1.12.0 restores cold.
-
-On GitHub-hosted runners, `objects` mode sets `MBX_GC_AUTO=0` for the job unless
-that environment variable is already set. This prevents mbx's local disk budget
-from immediately evicting a large restored bundle. The cache can grow during
-the job; set `MBX_GC_AUTO=1` in the job's environment to keep automatic cleanup.
-Self-hosted and unrecognized runners retain their existing GC policy. For a
-disposable self-hosted runner, set `MBX_GC_AUTO=0` in the job's environment to
-opt into the same behavior.
-
-The generated cache key includes the identity of the `rustc` on `PATH`
-(a hash of `rustc -vV`, the same identity Swatinem/rust-cache keys on). mbx
-keys every cached compilation on the compiler, so a store built by one
-toolchain matches nothing under another; scoping the key keeps each toolchain
-on its own cache instead of restoring one that can no longer produce hits—
-which otherwise happens whenever a runner image updates its preinstalled Rust.
-Install your toolchain **before** this action so the key sees the compiler the
-build will use; without a `rustc` on `PATH` the segment is the literal
-`norust`.
-
-A build that names its toolchain on its own command line is the one case the
-probe cannot see: `mbx +1.91 check` compiles with 1.91 while `rustc` on `PATH`
-still reports the default, so the 1.91 store lands under the default
-toolchain's key and the two share an entry. Name it with `toolchain` and the
-key follows it:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    toolchain: "1.91"
-- run: mbx +1.91 check --workspace
-```
-
-`toolchain` scopes the cache key only — it neither installs the toolchain nor
-selects it for the build.
-
-On Linux, the action also enables mbx's native link cache. This avoids relinking
-eligible test binaries and executables on a warm build. Set `cache-links: false`
-to opt out, or `cache-links: true` to opt in explicitly on another supported
-platform.
-
-The action accepts a resolved version only when GitHub reports that release as
-immutable and supplies an asset digest. Release metadata requests use
-`GITHUB_TOKEN` when set and otherwise use the `github-token` input; either requires
-`contents: read` permission.
-
-Change `cache-generation` when a cache-format or policy change should start
-fresh:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    version: 0.3.0
-    cache-generation: v2
-```
-
-When the Cargo workspace is not at the checkout root, point `working-directory`
-at it so the `target` payload caches that workspace's `target/` and prunes it
-against its own `cargo metadata`:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    working-directory: rust
-- run: mbx test --workspace
-  working-directory: rust
-```
-
-`cache-key` and newline-separated `restore-keys` are available when the default
-`${platform}-${architecture}-mbx-${generation}-${toolchain}-${commit}` layout
-is not enough. Use `cache-key-suffix` to give parallel jobs distinct primary
-keys while keeping the generated restore prefixes shared:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    cache-key-suffix: ${{ matrix.job }}
-```
-
-The suffix is appended after the complete generated key and does not alter
-restore prefixes, so a job can warm-start from another job's compatible entry.
-It accepts ASCII letters, numbers, periods, underscores, or hyphens, and the
-final generated key must be at most 512 characters. `cache-key-suffix` cannot be
-combined with `cache-key`; use `cache-key` alone when supplying the complete
-primary key yourself.
-
-### Saving beyond the default branch
-
-By default each pull request restores the default branch's baseline and throws away what it compiled, so the next revision of that pull request compiles it again. Three inputs opt other trusted runs into saving:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    save-on-pull-request: true
-    save-on-protected-branch: true
-```
-
-- `save-on-pull-request` saves successful `pull_request` runs whose head branch is in the same repository. GitHub scopes a pull request's cache entries to its merge ref (`refs/pull/<number>/merge`), so they are restored only by later runs of that pull request, never by the default branch, sibling pull requests, or other branches. Each saving run writes a new key. It restores the pull request's own latest entry when there is one, preferring one saved on the same base commit, and otherwise the base branch's latest entry, so `cache-hit` is `false` on these runs. Fork pull requests, `pull_request_target` runs, and the `closed` run of a merged pull request (which GitHub reports on the branch it merged into) never save.
-- `save-on-protected-branch` saves successful pushes to any non-default branch that has branch protection or rulesets (`GITHUB_REF_PROTECTED`), the same rule mbx applies when it decides whether a run may write to a cache server. Later pushes to that branch and pull requests that target it restore those entries.
-- `save-on-workflow-dispatch` saves successful `workflow_dispatch` runs; see [Inputs](#inputs).
-
-Every saved entry counts against the repository's cache storage limit (10 GB by default), and GitHub evicts the least recently used entries once it is exceeded. Pull requests that save a large `target` tree on every revision can push the default branch's baseline out; deleting a pull request's entries when it closes with `gh cache delete --all --ref refs/pull/<number>/merge` keeps that in check.
-
-A job whose `cache-mode` does not permit writes (`read` or `none`, set in the workflow or by GitHub's default for the trigger) never saves, whatever these inputs say.
-
-An explicit `cache-key` is used as given, so saving pull requests and dispatches do not get a fresh key per run. With a constant `cache-key`, the second revision restores the first one's entry as an exact hit and skips its save. Give the key a per-run suffix and a matching restore prefix:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    save-on-pull-request: true
-    cache-key: my-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-    restore-keys: my-build-
-```
-
-To keep one workflow's entries apart from another's, changing `cache-generation` is simpler and keeps the generated keys.
-
-The `cache-save-eligible` and `cache-save-reason` outputs say whether a run may attempt a save and why, for example `same-repository pull request` or `fork pull request`. An eligible run still skips the save after an exact cache hit or when the job produced nothing to cache.
+The action passes `latest-compatible` discovery to MBX, but this source packet
+does not qualify a compiled producer profile or prove candidate discovery and
+admission. This action does not create producer artifacts. A separately
+reviewed source-bound producer workflow must export MBX's native payload and
+upload it through its pinned artifact step. The consuming MBX profile decides
+which producer and artifact can be admitted. On a cold run, the comparison
+state output names the fixed path but the file is absent; export callers must
+omit comparison when that file does not exist and must not synthesize a baseline.
 
 ## Remote cache
 
-The `remote` backend points mbx at a cache server or an `s3://` bucket. With a
-cache server and OIDC:
-
 ```yaml
-permissions:
-  contents: read
-  id-token: write
-
-steps:
-  - uses: actions/checkout@v7
-  - uses: jdx/mr-boxington-action@v1
-    with:
-      backend: remote
-      remote-url: https://cache.example.com
-      namespace: acme/backend
-      oidc-audience: mbx-cache
-  - run: mbx build --workspace --all-features
-```
-
-Or pass a secret bearer token:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
+- uses: jdx/mr-boxington-action@<full-commit-sha>
   with:
     backend: remote
     remote-url: https://cache.example.com
-    namespace: acme/backend
-    token: ${{ secrets.MBX_REMOTE_TOKEN }}
+    namespace: project-name
+    token: ${{ secrets.MBX_CACHE_TOKEN }}
+    remote-mode: read-write
 ```
 
-An S3 bucket authenticates with the `AWS_*` variables instead, which
-`aws-actions/configure-aws-credentials` exports:
+The action exports only the remote settings supplied in inputs, preserving
+settings established by earlier steps or MBX configuration. `server-url` and
+`server-mode` aliases are not supported.
 
-```yaml
-permissions:
-  contents: read
-  id-token: write
-
-steps:
-  - uses: actions/checkout@v7
-  - uses: aws-actions/configure-aws-credentials@v6
-    with:
-      role-to-assume: arn:aws:iam::123456789012:role/mbx-cache
-      aws-region: us-east-1
-  - uses: jdx/mr-boxington-action@v1
-    with:
-      backend: remote
-      remote-url: s3://acme-build-cache/mbx
-      namespace: acme/backend
-  - run: mbx build --workspace --all-features
-```
-
-Each input the backend receives is exported as the matching `MBX_REMOTE_*`
-variable. A setting without an input keeps the value an earlier step exported,
-so a step that already configured mbx's remote needs no inputs repeated here:
-
-```yaml
-- run: |
-    echo "MBX_REMOTE_URL=s3://acme-build-cache/mbx" >> "$GITHUB_ENV"
-    echo "MBX_REMOTE_NAMESPACE=acme/backend" >> "$GITHUB_ENV"
-- uses: jdx/mr-boxington-action@v1
-  with:
-    backend: remote
-```
-
-After exporting, the action runs `mbx doctor` and fails the step when mbx finds
-no remote URL in its inputs, the environment, or mbx's user config file, or
-when mbx rejects the configuration, for example a URL without a namespace. A
-remote that is configured but cannot be reached only produces a warning.
-
-mbx itself writes to the remote only from pushes to protected branches. Every
-other run, including pull requests, tags, and releases, reads only, and a
-`write-only` remote is left unused. The server or bucket policy must still
-enforce its own authorization, and a release build that must not read from a
-shared cache should not configure a remote at all.
-
-`server` is an alias for `remote`, and `server-url` and `server-mode` are
-aliases for `remote-url` and `remote-mode`.
+For GitHub Actions OIDC, set `oidc-audience` and grant `id-token: write` to the
+job. The action exports the audience for later MBX commands; ordinary children
+of this action do not receive the OIDC request credentials.
 
 ## Inputs
 
-| Input                       | Default               | Purpose                                                                        |
-| --------------------------- | --------------------- | ------------------------------------------------------------------------------ |
-| `backend`                   | `github`              | `local`, `github`, or `remote`                                                 |
-| `version`                   |                       | mbx release version, or `latest`; when omitted, prefer `mbx` from `PATH`       |
-| `github-token`              | `${{ github.token }}` | Token used when `GITHUB_TOKEN` is not exported                                 |
-| `cache-generation`          | `v1`                  | Generated GitHub cache key generation                                          |
-| `github-cache-mode`         | `target`              | GitHub payload: warm Cargo `target` tree or portable mbx `objects`             |
-| `isolate-objects-cache`     | `false`               | Put GitHub `objects` mode in a private `RUNNER_TEMP` store and save its bundle |
-| `save-on-workflow-dispatch` | `false`               | Save after a successful trusted `workflow_dispatch` run                        |
-| `save-on-pull-request`      | `false`               | Save after a successful same-repository pull request, scoped to it             |
-| `save-on-protected-branch`  | `false`               | Save after a successful push to a protected non-default branch                 |
-| `toolchain`                 |                       | Toolchain the build names, such as `1.91` or `+1.91`; the cache key follows it |
-| `working-directory`         | `.`                   | Cargo workspace whose `target/` the `target` payload caches                    |
-| `cache-links`               | `auto`                | Cache native links; automatically enabled on Linux                             |
-| `cache-key`                 | generated             | Complete GitHub cache primary key                                              |
-| `cache-key-suffix`          |                       | Safe suffix for generated primary keys; restore prefixes stay shared           |
-| `restore-keys`              | generated             | Newline-separated GitHub restore prefixes                                      |
-| `remote-url`                |                       | Cache server URL or `s3://` bucket; keeps `MBX_REMOTE_URL` when omitted        |
-| `namespace`                 |                       | Remote namespace; keeps `MBX_REMOTE_NAMESPACE` when omitted                    |
-| `oidc-audience`             |                       | OIDC audience for a cache server                                               |
-| `token`                     |                       | Secret bearer token for a cache server                                         |
-| `token-file`                |                       | Bearer-token file for a cache server                                           |
-| `remote-mode`               |                       | Remote mode; keeps `MBX_REMOTE_MODE` when omitted, and mbx defaults to `read-write` |
-
-`save-on-workflow-dispatch` is intended for explicitly trusted cache-seeding
-and benchmark workflows. It does not affect pull requests or pushes, which
-follow `save-on-pull-request` and `save-on-protected-branch`. Pair it with a new
-`cache-generation` when an mbx upgrade changes cache behavior. Each saving
-dispatch restores the latest compatible cache and writes its learned state to
-a new immutable key for the next dispatch.
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `backend` | `local` | `local` or `remote` MBX mode |
+| `version` | PATH, then `latest` | MBX release version to use |
+| `mbx-path` | | Absolute preinstalled MBX executable |
+| `expected-version` | | Exact version required for `mbx-path` |
+| `expected-binary-sha256` | | Source-bound digest required for `mbx-path` |
+| `snapshot-selection` | `none` | `none`, `latest-compatible`, or `artifact-id` |
+| `snapshot-artifact-id` | | Untrusted service ID; required only for `artifact-id` selection |
+| `snapshot-read-token` | `${{ github.token }}` | Token with `actions:read`, `attestations:read`, and `contents:read`, used only by native snapshot import |
+| `cache-links` | `auto` | Whether MBX caches native links |
+| `remote-url` | | Remote server URL or S3 bucket |
+| `namespace` | | Remote cache namespace |
+| `token` | | Remote cache bearer token |
+| `token-file` | | Remote cache bearer token file |
+| `oidc-audience` | | Remote cache OIDC audience |
+| `remote-mode` | | `read-write`, `read-only`, or `write-only` |
 
 ## Outputs
 
-- `mbx-version` — installed version.
-- `cache-hit` — `true` for an exact GitHub cache-key match.
-- `cache-primary-key` — key used by the GitHub backend.
-- `cache-save-eligible` — `true` when the GitHub backend may attempt a save after a successful job.
-- `cache-save-reason` — why the GitHub backend may or may not save.
-
-## License
-
-[MIT](LICENSE)
+| Output | Meaning |
+| --- | --- |
+| `native-snapshot-imported` | `true` only when MBX reports authenticated workspace restoration |
+| `native-snapshot-comparison-state` | Fixed private-store path; file exists only after authenticated import |
+| `mbx-version` | Selected MBX version |
