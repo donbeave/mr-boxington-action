@@ -296,8 +296,21 @@ describe('action main', () => {
     expect(mocks.failed).not.toHaveBeenCalled()
   })
 
-  it('rejects GitHub cache as a backend instead of silently restoring or saving', async () => {
-    mocks.inputs.backend = 'github'
+  it('requires the complete source-bound binary tuple before native selection and never falls back', async () => {
+    delete mocks.inputs['mbx-path']
+    delete mocks.inputs['expected-version']
+    delete mocks.inputs['expected-binary-sha256']
+    mocks.inputs['snapshot-selection'] = 'latest-compatible'
+    mocks.inputs['snapshot-read-token'] = ''
+    await loadAction()
+    expect(mocks.failed).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('native snapshots require mbx-path, expected-version, and expected-binary-sha256')
+    }))
+    expect(mocks.calls).toEqual([])
+  })
+
+  it.each(['github', 'server'])('rejects removed %s backend aliases before setup', async backend => {
+    mocks.inputs.backend = backend
     await loadAction()
     expect(mocks.failed).toHaveBeenCalledWith(expect.objectContaining({message: expect.stringContaining('backend must be "local" or "remote"')}))
     expect(mocks.calls).toEqual([])
@@ -316,6 +329,18 @@ describe('action main', () => {
       MBX_REMOTE_TOKEN: 'remote-secret',
       MBX_REMOTE_MODE: 'read-only'
     })
+    expect(mocks.failed).not.toHaveBeenCalled()
+  })
+
+  it('keeps inherited remote configuration when the action receives no replacement values', async () => {
+    mocks.inputs.backend = 'remote'
+    vi.stubEnv('MBX_REMOTE_URL', 's3://cache.example/project')
+    vi.stubEnv('MBX_REMOTE_NAMESPACE', 'inherited')
+    vi.stubEnv('MBX_REMOTE_MODE', 'read-only')
+    await loadSuccessfulAction()
+    expect(process.env.MBX_REMOTE_URL).toBe('s3://cache.example/project')
+    expect(process.env.MBX_REMOTE_NAMESPACE).toBe('inherited')
+    expect(process.env.MBX_REMOTE_MODE).toBe('read-only')
     expect(mocks.failed).not.toHaveBeenCalled()
   })
 })
