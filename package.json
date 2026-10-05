@@ -2,7 +2,7 @@
   "name": "mr-boxington-action",
   "version": "1.7.0",
   "private": true,
-  "description": "Set up mr boxington with local storage, GitHub Actions cache, or a remote cache server",
+  "description": "Set up mbx with local storage, authenticated native snapshots, or a remote cache server",
   "main": "dist/index.js",
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.js --minify",
@@ -16,10 +16,8 @@
     "url": "git+https://github.com/jdx/mr-boxington-action.git"
   },
   "dependencies": {
-    "@actions/cache": "6.2.0",
     "@actions/core": "3.0.1",
     "@actions/exec": "3.0.0",
-    "@actions/github": "9.1.1",
     "@actions/tool-cache": "4.0.0"
   },
   "devDependencies": {
