@@ -4,7 +4,6 @@ import {describe, expect, it} from 'vitest'
 import {
   aliasedInput,
   cacheLinksValue,
-  cacheRevision,
   canReuseCachedMbx,
   callingCard,
   cargoTargetDirectory,
@@ -22,14 +21,12 @@ import {
   parseGithubCacheMode,
   parsedMbxVersion,
   primaryCacheKey,
-  pullRequestRestoreKey,
   remoteExports,
   remoteStatus,
   requireGithubCacheRuntime,
   releaseTarget,
   rustcIdentityArgs,
   cacheModePermitsWrites,
-  isSameRepositoryPullRequest,
   savePolicy,
   supportsDirectoryBundle,
   toolchainSegment,
@@ -257,16 +254,6 @@ describe('inputs', () => {
     expect(effectiveRestoreKeys([], ['generated-default-'])).toEqual(['generated-default-'])
   })
 
-  it("asks for a saving pull request's own runs without naming its base entry", () => {
-    const base = generatedKey('linux', 'x64', 'v2', 'rust-0123456789ab', 'abc')
-    const key = pullRequestRestoreKey('linux', 'x64', 'v2', 'rust-0123456789ab', 'abc')
-    // A restore key equal to a saved key wins over every prefix match, so it
-    // must reach this pull request's runs without equalling the base entry.
-    expect(key).toBe(`${base}-run-`)
-    expect(`${base}-run-42-1`.startsWith(key)).toBe(true)
-    expect(base.startsWith(key)).toBe(false)
-  })
-
   it('keeps a directory bundle out of the tar key space', () => {
     // A tar entry and a directory entry cannot restore each other, so they
     // must never share a key. The tar form keeps the bare generation it has
@@ -335,59 +322,25 @@ describe('inputs', () => {
 })
 
 describe('save policy', () => {
-  const saves = (eventName: string, ref: string, extra = {}, options = {}) =>
-    savePolicy({eventName, ref, defaultBranch: 'main', ...extra}, options).save
+  const saves = (eventName: string, ref: string, extra = {}) =>
+    savePolicy({eventName, ref, defaultBranch: 'main', refProtected: true, ...extra}).save
 
-  it('rolls saving non-push runs onto a fresh immutable cache key', () => {
-    expect(cacheRevision('workflow_dispatch', 'abc123', true, 42, 3)).toBe(
-      'abc123-run-42-3'
-    )
-    expect(cacheRevision('pull_request', 'abc123', true, 42, 3)).toBe('abc123-run-42-3')
-    expect(cacheRevision('workflow_dispatch', 'abc123', false, 42, 3)).toBe('abc123')
-    expect(cacheRevision('pull_request', 'abc123', false, 42, 3)).toBe('abc123')
-    expect(cacheRevision('push', 'abc123', true, 42, 3)).toBe('abc123')
-  })
-
-  it('saves only default-branch pushes by default', () => {
+  it('saves only protected default-branch pushes', () => {
     expect(saves('push', 'refs/heads/main')).toBe(true)
     expect(saves('push', 'refs/heads/main', {defaultBranch: undefined})).toBe(false)
-    expect(saves('pull_request', 'refs/pull/1/merge', {sameRepository: true})).toBe(false)
-    expect(saves('push', 'refs/heads/topic')).toBe(false)
+    expect(saves('push', 'refs/heads/main', {refProtected: false})).toBe(false)
+    expect(saves('pull_request', 'refs/pull/1/merge')).toBe(false)
+    expect(saves('push', 'refs/heads/topic', {refProtected: false})).toBe(false)
     expect(saves('push', 'refs/heads/release', {refProtected: true})).toBe(false)
     expect(saves('workflow_dispatch', 'refs/heads/topic')).toBe(false)
     expect(saves('push', 'refs/tags/v1.0.0', {refProtected: true})).toBe(false)
   })
 
-  it('can opt trusted workflow dispatches into saving', () => {
-    const options = {workflowDispatch: true}
-    expect(saves('workflow_dispatch', 'refs/heads/benchmark', {}, options)).toBe(true)
-    expect(saves('pull_request', 'refs/pull/1/merge', {sameRepository: true}, options)).toBe(false)
-    expect(saves('push', 'refs/heads/topic', {}, options)).toBe(false)
-  })
-
-  it('can opt same-repository pull requests into saving', () => {
-    const options = {pullRequest: true}
-    expect(saves('pull_request', 'refs/pull/1/merge', {sameRepository: true}, options)).toBe(true)
-    expect(saves('pull_request', 'refs/pull/1/merge', {sameRepository: false}, options)).toBe(false)
-    expect(saves('pull_request_target', 'refs/heads/main', {sameRepository: true}, options)).toBe(false)
-    // A merged pull request's `closed` run reports the branch it merged into.
-    expect(saves('pull_request', 'refs/heads/release', {sameRepository: true}, options)).toBe(false)
-    expect(saves('push', 'refs/heads/topic', {}, options)).toBe(false)
-  })
-
-  it('can opt protected-branch pushes into saving', () => {
-    const options = {protectedBranch: true}
-    expect(saves('push', 'refs/heads/release', {refProtected: true}, options)).toBe(true)
-    expect(saves('push', 'refs/heads/topic', {refProtected: false}, options)).toBe(false)
-    expect(saves('push', 'refs/tags/v1.0.0', {refProtected: true}, options)).toBe(false)
-    expect(saves('pull_request', 'refs/pull/1/merge', {refProtected: true, sameRepository: true}, options)).toBe(false)
-  })
-
-  it('respects the cache-mode GitHub granted the job', () => {
-    const run = {eventName: 'push', ref: 'refs/heads/main', defaultBranch: 'main'}
+  it('treats cache-mode as a client hint, never as write authorization', () => {
+    const run = {eventName: 'push', ref: 'refs/heads/main', defaultBranch: 'main', refProtected: true}
     expect(savePolicy({...run, cacheMode: 'read'})).toEqual({
       save: false,
-      reason: 'default-branch push; cache-mode read does not permit writes'
+      reason: 'default-branch push; client cache-mode hint read skips writes'
     })
     expect(savePolicy({...run, cacheMode: 'none'}).save).toBe(false)
     expect(savePolicy({...run, cacheMode: 'write'}).save).toBe(true)
@@ -395,33 +348,21 @@ describe('save policy', () => {
     expect(savePolicy({...run, cacheMode: ''}).save).toBe(true)
     expect(savePolicy({...run, cacheMode: 'future-mode'}).save).toBe(true)
     expect(savePolicy({...run, ref: 'refs/heads/topic', cacheMode: 'read'}).reason).toBe(
-      'unprotected-branch push'
+      'protected non-default branch push'
     )
+    expect(savePolicy({...run, refProtected: false, cacheMode: 'write'}).save).toBe(false)
     expect(savePolicy({...run, cacheMode: ' READ '}).save).toBe(false)
     expect(cacheModePermitsWrites('read')).toBe(false)
   })
 
   it('explains each decision', () => {
-    const reason = (eventName: string, ref: string, extra = {}, options = {}) =>
-      savePolicy({eventName, ref, defaultBranch: 'main', ...extra}, options).reason
+    const reason = (eventName: string, ref: string, extra = {}) =>
+      savePolicy({eventName, ref, defaultBranch: 'main', refProtected: true, ...extra}).reason
     expect(reason('push', 'refs/heads/main')).toBe('default-branch push')
-    expect(reason('push', 'refs/heads/topic')).toBe('unprotected-branch push')
-    expect(reason('pull_request', 'refs/pull/1/merge')).toBe('fork pull request')
-    expect(reason('pull_request', 'refs/pull/1/merge', {sameRepository: true})).toBe(
-      'pull request; save-on-pull-request is off'
-    )
+    expect(reason('push', 'refs/heads/topic')).toBe('protected non-default branch push')
+    expect(reason('push', 'refs/heads/topic', {refProtected: false})).toBe('unprotected-branch push')
+    expect(reason('pull_request', 'refs/pull/1/merge')).toBe('pull_request event')
     expect(reason('schedule', 'refs/heads/main')).toBe('schedule event')
-    expect(
-      reason('pull_request', 'refs/heads/main', {sameRepository: true}, {pullRequest: true})
-    ).toBe('pull request outside its merge ref')
-  })
-
-  it('treats a pull request as a fork unless its head is in the base repository', () => {
-    const repo = (full_name: string) => ({repo: {full_name}})
-    expect(isSameRepositoryPullRequest({head: repo('jdx/mbx'), base: repo('jdx/mbx')})).toBe(true)
-    expect(isSameRepositoryPullRequest({head: repo('fork/mbx'), base: repo('jdx/mbx')})).toBe(false)
-    expect(isSameRepositoryPullRequest({head: {repo: null}, base: repo('jdx/mbx')})).toBe(false)
-    expect(isSameRepositoryPullRequest(undefined)).toBe(false)
   })
 })
 

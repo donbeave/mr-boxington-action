@@ -328,29 +328,6 @@ export function effectiveRestoreKeys(
 }
 
 /**
- * The restore key that leads a saving pull request back to its own latest
- * entry on its base commit.
- *
- * Its primary key is unique to the run, so it never matches. GitHub's cache
- * service takes a restore key that matches an entry exactly over every prefix
- * match, whichever order the keys were given in. Listing the base commit's own
- * key would therefore restore the base branch's entry on every revision and
- * never the pull request's own. This prefix cannot match any entry exactly. It
- * reaches the pull request's runs on that base, which GitHub finds in the pull
- * request's own scope, and the generated restore key after it falls back to
- * the pull request's newest entry and then the base branch's.
- */
-export function pullRequestRestoreKey(
-  os: string,
-  arch: string,
-  generation: string,
-  toolchain: string,
-  baseSha: string
-): string {
-  return `${generatedKey(os, arch, generation, toolchain, baseSha)}-run-`
-}
-
-/**
  * Whether an installed mbx can read and write directory-form bundles.
  *
  * `mbx cache export --format directory` arrived in mbx 1.12.0, and an older
@@ -426,37 +403,13 @@ export function toolchainSegment(rustcIdentity: string | null): string {
   return `rust-${createHash('sha256').update(identity).digest('hex').slice(0, 12)}`
 }
 
-/**
- * Give saving runs other than pushes a fresh primary key. A dispatch or a pull
- * request can save many times against one commit, and GitHub's immutable cache
- * would otherwise keep only the first entry and drop what later runs learned
- * after restoring it.
- */
-export function cacheRevision(
-  eventName: string,
-  sha: string,
-  save: boolean,
-  runId: number,
-  runAttempt: number
-): string {
-  return save && eventName !== 'push' ? `${sha}-run-${runId}-${runAttempt}` : sha
-}
-
-export interface SaveOptions {
-  workflowDispatch?: boolean
-  pullRequest?: boolean
-  protectedBranch?: boolean
-}
-
 export interface SaveContext {
   eventName: string
   ref: string
   defaultBranch?: string | null
   /** `GITHUB_REF_PROTECTED`: the ref has branch protection or rulesets. */
   refProtected?: boolean
-  /** Whether a pull request's head branch lives in the base repository. */
-  sameRepository?: boolean
-  /** `ACTIONS_CACHE_MODE`: the cache access GitHub granted this job. */
+  /** Client-side ACTIONS_CACHE_MODE hint; it does not authorize writes. */
   cacheMode?: string
 }
 
@@ -466,22 +419,16 @@ export interface SaveDecision {
 }
 
 /**
- * Whether a successful job saves the GitHub cache, and why.
- *
- * Default-branch pushes always save. Protected-branch pushes, same-repository
- * pull requests, and dispatches save only when opted in. A fork pull request
- * never saves: GitHub would accept its write into the pull request's own
- * scope, but nothing about the run is trusted.
- *
- * A save the policy allows is still skipped when GitHub's `cache-mode` for
- * the job denies writes, so the decision says so up front instead of pruning
- * and exporting a payload the cache library would then drop.
+ * Only protected default-branch pushes may save. The event/ref check is
+ * defense in depth; GitHub's cache service remains the write authority.
+ * ACTIONS_CACHE_MODE can suppress save work on read-only jobs, but cannot
+ * authorize a write.
  */
-export function savePolicy(run: SaveContext, options: SaveOptions = {}): SaveDecision {
-  const decision = eventSavePolicy(run, options)
+export function savePolicy(run: SaveContext): SaveDecision {
+  const decision = eventSavePolicy(run)
   const mode = run.cacheMode?.trim().toLowerCase() ?? ''
   if (decision.save && !cacheModePermitsWrites(mode)) {
-    return {save: false, reason: `${decision.reason}; cache-mode ${mode} does not permit writes`}
+    return {save: false, reason: `${decision.reason}; client cache-mode hint ${mode} skips writes`}
   }
   return decision
 }
@@ -495,45 +442,16 @@ export function cacheModePermitsWrites(mode: string): boolean {
   return mode === 'write' || mode === 'write-only'
 }
 
-function eventSavePolicy(run: SaveContext, options: SaveOptions): SaveDecision {
+function eventSavePolicy(run: SaveContext): SaveDecision {
   const {eventName, ref, defaultBranch} = run
   if (eventName === 'push' && ref.startsWith('refs/heads/')) {
+    if (run.refProtected !== true) return {save: false, reason: 'unprotected-branch push'}
     if (defaultBranch && ref === `refs/heads/${defaultBranch}`) {
       return {save: true, reason: 'default-branch push'}
     }
-    if (!run.refProtected) return {save: false, reason: 'unprotected-branch push'}
-    return options.protectedBranch
-      ? {save: true, reason: 'protected-branch push'}
-      : {save: false, reason: 'protected-branch push; save-on-protected-branch is off'}
-  }
-  if (eventName === 'pull_request') {
-    if (!run.sameRepository) return {save: false, reason: 'fork pull request'}
-    // Once a pull request is merged, its `closed` run reports the branch it
-    // merged into, and a save there would land in that branch's scope.
-    if (!/^refs\/pull\/\d+\/merge$/.test(ref)) {
-      return {save: false, reason: 'pull request outside its merge ref'}
-    }
-    return options.pullRequest
-      ? {save: true, reason: 'same-repository pull request'}
-      : {save: false, reason: 'pull request; save-on-pull-request is off'}
-  }
-  if (eventName === 'workflow_dispatch') {
-    return options.workflowDispatch
-      ? {save: true, reason: 'workflow_dispatch'}
-      : {save: false, reason: 'workflow_dispatch; save-on-workflow-dispatch is off'}
+    return {save: false, reason: 'protected non-default branch push'}
   }
   return {save: false, reason: `${eventName} event`}
-}
-
-export interface PullRequestRepositories {
-  head?: {repo?: {full_name?: string} | null}
-  base?: {repo?: {full_name?: string} | null}
-}
-
-/** A pull request whose head repository is gone is treated as a fork. */
-export function isSameRepositoryPullRequest(pullRequest?: PullRequestRepositories): boolean {
-  const head = pullRequest?.head?.repo?.full_name
-  return Boolean(head && head === pullRequest?.base?.repo?.full_name)
 }
 
 /**

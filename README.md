@@ -6,6 +6,18 @@ bucket. When
 `version` is omitted, the action uses `mbx` from `PATH` and downloads the latest
 release only when it is absent. Setting `version` always installs that release.
 
+To use a caller-verified executable without installing or downloading mbx,
+supply `mbx-path`, `expected-version`, and `expected-binary-sha256` together.
+The action checks the exact bytes and version before use and again around a
+comparison-mode post export. These inputs cannot be combined with `version`.
+
+GitHub `objects` mode can use a fresh `comparison-state` file inside
+`RUNNER_TEMP`. This strict mode needs the verified executable, an explicit
+stable `cache-key` compatibility identity, and ordered source-bound
+`restore-keys`. Useful native export reports append their semantic digest to
+the key. The action skips upload when the restored semantic snapshot is
+unchanged; workspace persistence remains unqualified by this action.
+
 ## Local filesystem
 
 ```yaml
@@ -35,10 +47,9 @@ steps:
 
 The default backend restores Cargo's pruned target directory and registry from
 the previous compatible build on every run, so a job that changes a few files
-recompiles only those crates. It saves a new immutable entry for pushes to the
-repository's default branch. Pull requests and other branches are
-restore-only unless opted in below, and fork pull requests are always
-restore-only.
+recompiles only those crates. It saves a new immutable entry only after a
+successful push to a protected default branch. Pull requests and all other
+branches are restore-only.
 
 The action disables mbx-managed target views and native-link object caching so
 it can transport the in-place `target` tree without also transporting mbx's
@@ -169,38 +180,20 @@ final generated key must be at most 512 characters. `cache-key-suffix` cannot be
 combined with `cache-key`; use `cache-key` alone when supplying the complete
 primary key yourself.
 
-### Saving beyond the default branch
+### Write policy
 
-By default each pull request restores the default branch's baseline and throws away what it compiled, so the next revision of that pull request compiles it again. Three inputs opt other trusted runs into saving:
+Only successful pushes to a protected default branch may publish GitHub cache
+entries. Pull requests, dispatches, tags, unprotected refs, and protected
+non-default branches remain restore-only. GitHub's cache service decides
+whether an attempted write is authorized.
 
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    save-on-pull-request: true
-    save-on-protected-branch: true
-```
+An `ACTIONS_CACHE_MODE` hint of `read` or `none` makes this action skip
+save-side pruning and export. The hint cannot authorize a write; the event,
+ref, and protection checks still gate save attempts.
 
-- `save-on-pull-request` saves successful `pull_request` runs whose head branch is in the same repository. GitHub scopes a pull request's cache entries to its merge ref (`refs/pull/<number>/merge`), so they are restored only by later runs of that pull request, never by the default branch, sibling pull requests, or other branches. Each saving run writes a new key. It restores the pull request's own latest entry when there is one, preferring one saved on the same base commit, and otherwise the base branch's latest entry, so `cache-hit` is `false` on these runs. Fork pull requests, `pull_request_target` runs, and the `closed` run of a merged pull request (which GitHub reports on the branch it merged into) never save.
-- `save-on-protected-branch` saves successful pushes to any non-default branch that has branch protection or rulesets (`GITHUB_REF_PROTECTED`), the same rule mbx applies when it decides whether a run may write to a cache server. Later pushes to that branch and pull requests that target it restore those entries.
-- `save-on-workflow-dispatch` saves successful `workflow_dispatch` runs; see [Inputs](#inputs).
-
-Every saved entry counts against the repository's cache storage limit (10 GB by default), and GitHub evicts the least recently used entries once it is exceeded. Pull requests that save a large `target` tree on every revision can push the default branch's baseline out; deleting a pull request's entries when it closes with `gh cache delete --all --ref refs/pull/<number>/merge` keeps that in check.
-
-A job whose `cache-mode` does not permit writes (`read` or `none`, set in the workflow or by GitHub's default for the trigger) never saves, whatever these inputs say.
-
-An explicit `cache-key` is used as given, so saving pull requests and dispatches do not get a fresh key per run. With a constant `cache-key`, the second revision restores the first one's entry as an exact hit and skips its save. Give the key a per-run suffix and a matching restore prefix:
-
-```yaml
-- uses: jdx/mr-boxington-action@v1
-  with:
-    save-on-pull-request: true
-    cache-key: my-build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-    restore-keys: my-build-
-```
-
-To keep one workflow's entries apart from another's, changing `cache-generation` is simpler and keeps the generated keys.
-
-The `cache-save-eligible` and `cache-save-reason` outputs say whether a run may attempt a save and why, for example `same-repository pull request` or `fork pull request`. An eligible run still skips the save after an exact cache hit or when the job produced nothing to cache.
+Comparison mode's `cache-save-eligible` and `cache-save-reason` outputs report
+whether a protected default-branch push may attempt a save. An eligible run
+still skips an unchanged semantic snapshot or a target-cache exact hit.
 
 ## Remote cache
 
@@ -289,32 +282,26 @@ aliases for `remote-url` and `remote-mode`.
 | --------------------------- | --------------------- | ------------------------------------------------------------------------------ |
 | `backend`                   | `github`              | `local`, `github`, or `remote`                                                 |
 | `version`                   |                       | mbx release version, or `latest`; when omitted, prefer `mbx` from `PATH`       |
+| `mbx-path`                  |                       | Absolute preinstalled executable path; requires version and SHA-256; never downloads |
+| `expected-version`          |                       | Exact version required from `mbx-path`; excludes `version`                    |
+| `expected-binary-sha256`     |                       | Caller descriptor's exact lowercase binary SHA-256; required before execution |
+| `comparison-state`          |                       | Fresh path in `RUNNER_TEMP`; strict GitHub objects mode saves useful semantic snapshots |
 | `github-token`              | `${{ github.token }}` | Token used when `GITHUB_TOKEN` is not exported                                 |
 | `cache-generation`          | `v1`                  | Generated GitHub cache key generation                                          |
 | `github-cache-mode`         | `target`              | GitHub payload: warm Cargo `target` tree or portable mbx `objects`             |
 | `isolate-objects-cache`     | `false`               | Put GitHub `objects` mode in a private `RUNNER_TEMP` store and save its bundle |
-| `save-on-workflow-dispatch` | `false`               | Save after a successful trusted `workflow_dispatch` run                        |
-| `save-on-pull-request`      | `false`               | Save after a successful same-repository pull request, scoped to it             |
-| `save-on-protected-branch`  | `false`               | Save after a successful push to a protected non-default branch                 |
 | `toolchain`                 |                       | Toolchain the build names, such as `1.91` or `+1.91`; the cache key follows it |
 | `working-directory`         | `.`                   | Cargo workspace whose `target/` the `target` payload caches                    |
 | `cache-links`               | `auto`                | Cache native links; automatically enabled on Linux                             |
-| `cache-key`                 | generated             | Complete GitHub cache primary key                                              |
+| `cache-key`                 | generated             | Primary key; comparison mode requires a comma-free compatibility base up to 447 characters |
 | `cache-key-suffix`          |                       | Safe suffix for generated primary keys; restore prefixes stay shared           |
-| `restore-keys`              | generated             | Newline-separated GitHub restore prefixes                                      |
+| `restore-keys`              | generated             | Newline-separated restore prefixes; comparison mode requires up to nine source-bound prefixes |
 | `remote-url`                |                       | Cache server URL or `s3://` bucket; keeps `MBX_REMOTE_URL` when omitted        |
 | `namespace`                 |                       | Remote namespace; keeps `MBX_REMOTE_NAMESPACE` when omitted                    |
 | `oidc-audience`             |                       | OIDC audience for a cache server                                               |
 | `token`                     |                       | Secret bearer token for a cache server                                         |
 | `token-file`                |                       | Bearer-token file for a cache server                                           |
 | `remote-mode`               |                       | Remote mode; keeps `MBX_REMOTE_MODE` when omitted, and mbx defaults to `read-write` |
-
-`save-on-workflow-dispatch` is intended for explicitly trusted cache-seeding
-and benchmark workflows. It does not affect pull requests or pushes, which
-follow `save-on-pull-request` and `save-on-protected-branch`. Pair it with a new
-`cache-generation` when an mbx upgrade changes cache behavior. Each saving
-dispatch restores the latest compatible cache and writes its learned state to
-a new immutable key for the next dispatch.
 
 ## Outputs
 

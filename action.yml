@@ -13,17 +13,29 @@ inputs:
   version:
     description: mbx release version to install, such as "0.4.0", or "latest"; when omitted, use mbx from PATH or install latest
     required: false
+  mbx-path:
+    description: Absolute path to a verified preinstalled mbx executable; requires expected-version and expected-binary-sha256; never downloads mbx
+    required: false
+  expected-version:
+    description: Exact version required from mbx-path; cannot be combined with version
+    required: false
+  expected-binary-sha256:
+    description: Mandatory lowercase SHA-256 of mbx-path from the caller's source-bound platform descriptor; checked before any execution
+    required: false
+  comparison-state:
+    description: Fresh absolute owner comparison-state path inside RUNNER_TEMP; requires strict preinstalled mbx and GitHub objects mode; only protected default-branch pushes may save useful semantic snapshots
+    required: false
   github-token:
     description: GitHub token used to resolve mbx release metadata
     default: ${{ github.token }}
   cache-key:
-    description: Complete primary key for the GitHub cache backend
+    description: Primary GitHub cache key; comparison mode requires a stable caller-supplied comma-free compatibility identity up to 447 characters and appends the native semantic snapshot digest when saving
     required: false
   cache-key-suffix:
     description: Safe suffix appended to the generated primary key; cannot be used with cache-key
     required: false
   restore-keys:
-    description: Newline-separated restore key prefixes for the GitHub cache backend
+    description: Newline-separated GitHub restore prefixes; comparison-state requires at most nine caller-supplied ordered source-bound prefixes
     required: false
   cache-generation:
     description: Value included in generated GitHub cache keys; change it to start fresh
@@ -33,15 +45,6 @@ inputs:
     default: target
   isolate-objects-cache:
     description: Use a private RUNNER_TEMP mbx store and bundle for GitHub objects caching; intended for disposable hosted runners
-    default: "false"
-  save-on-workflow-dispatch:
-    description: Save the GitHub cache after a successful workflow_dispatch run; enable only in trusted workflows
-    default: "false"
-  save-on-pull-request:
-    description: Save the GitHub cache after a successful same-repository pull_request run, scoped to that pull request; fork pull requests never save
-    default: "false"
-  save-on-protected-branch:
-    description: Save the GitHub cache after a successful push to a protected non-default branch
     default: "false"
   toolchain:
     description: Rust toolchain the build names on its own command line, such as "1.91"; the generated cache key follows it instead of the default rustc
@@ -83,9 +86,9 @@ outputs:
   cache-primary-key:
     description: Primary GitHub cache key used by the action
   cache-save-eligible:
-    description: Whether the GitHub backend may attempt a save after a successful job; an exact cache hit or an empty payload still skips it
+    description: Whether the GitHub backend may attempt a save after a successful job; exact target hits, unchanged comparison snapshots, and empty payloads still skip it
   cache-save-reason:
-    description: Why the GitHub backend may or may not save, such as "fork pull request"
+    description: Why the GitHub backend may or may not save, such as "default-branch push" or "pull_request event"
   mbx-version:
     description: Installed mbx version
 

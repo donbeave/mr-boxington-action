@@ -848,10 +848,22 @@ export async function saveIsolatedObjectsBundle(options: {
   cargoTarget: string
   exportBundle: (bundlePath: string) => Promise<{exitCode: number; output: string}>
   isEmptyExport: (output: string) => boolean
+  exportReport?: (output: string) => {useful: boolean; cacheKey: string}
+  restoredKey?: string
+  optionalUpload?: boolean
   saveCache: (paths: string[], primaryKey: string) => Promise<number>
   emit: (message: string) => void
   warn: (message: string) => void
-}): Promise<'ineligible' | 'exact-hit' | 'empty' | 'saved' | 'save-unavailable'> {
+}): Promise<
+  | 'ineligible'
+  | 'exact-hit'
+  | 'empty'
+  | 'unchanged'
+  | 'not-useful'
+  | 'export-unavailable'
+  | 'saved'
+  | 'save-unavailable'
+> {
   await validateObjectsCachePaths(options.paths)
   await reportObjectsResourcePhase(
     options.paths,
@@ -860,7 +872,7 @@ export async function saveIsolatedObjectsBundle(options: {
     options.emit
   )
   if (!options.saveEligible) return 'ineligible'
-  if (options.exactHit) return 'exact-hit'
+  if (options.exactHit && !options.exportReport) return 'exact-hit'
   if (await maybeLstat(options.paths.bundle) !== MISSING) {
     throw new Error('private objects bundle already exists before export')
   }
@@ -883,7 +895,21 @@ export async function saveIsolatedObjectsBundle(options: {
       options.emit('No completed mbx build was recorded; not saving an empty cache')
       return 'empty'
     }
+    if (options.exportReport) {
+      options.warn(`Optional mbx cache export exited with code ${exported.result.exitCode}; skipping cache save`)
+      return 'export-unavailable'
+    }
     throw new Error(`mbx cache export exited with code ${exported.result.exitCode}`)
+  }
+  const report = options.exportReport?.(exported.result.output)
+  if (report && !report.useful) {
+    options.emit('No exported useful mbx owner-state bundle; skipping cache save')
+    return 'not-useful'
+  }
+  const cacheKey = report?.cacheKey ?? options.primaryKey
+  if (report && options.restoredKey === cacheKey) {
+    options.emit(`The restored semantic snapshot ${cacheKey} is unchanged; skipping duplicate cache save`)
+    return 'unchanged'
   }
   await validateObjectsCachePaths(options.paths)
   const bundleUsage = await validateObjectsBundle(options.paths)
@@ -913,7 +939,7 @@ export async function saveIsolatedObjectsBundle(options: {
     options.paths,
     options.cargoTarget,
     'actions-cache-save',
-    () => withBoundedActionOutput(() => options.saveCache([options.paths.bundle], options.primaryKey)),
+    () => withBoundedActionOutput(() => options.saveCache([options.paths.bundle], cacheKey)),
     options.emit
   )
   const {result: saveResult, output} = sampled.result
@@ -935,6 +961,11 @@ export async function saveIsolatedObjectsBundle(options: {
     return 'save-unavailable'
   }
   if (failure === 'local-storage') {
+    if (options.optionalUpload) {
+      options.warn('Optional mbx objects cache upload skipped because runner storage is full')
+      await removeObjectsBundle(options.paths)
+      return 'save-unavailable'
+    }
     throw new Error('actions/cache could not stage the local archive because runner storage is full')
   }
   const v2CacheService =
@@ -950,6 +981,11 @@ export async function saveIsolatedObjectsBundle(options: {
   const hasSuccessEvidence =
     output.includes('Cache saved successfully') || (v2CacheService && saveResult >= 0)
   if (saveResult < 0 || !hasSuccessEvidence) {
+    if (options.optionalUpload) {
+      options.warn('Optional mbx objects cache upload returned without confirmed success; skipping cache save')
+      await removeObjectsBundle(options.paths)
+      return 'save-unavailable'
+    }
     throw new Error('actions/cache did not provide evidence that the objects bundle was saved')
   }
   options.emit(

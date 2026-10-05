@@ -4,15 +4,28 @@ import * as exec from '@actions/exec'
 import {context} from '@actions/github'
 import * as tc from '@actions/tool-cache'
 import {createHash, randomUUID} from 'node:crypto'
-import {access, chmod, copyFile, mkdir, readFile, stat} from 'node:fs/promises'
+import {access, chmod, copyFile, mkdir, readFile, realpath, rm, stat} from 'node:fs/promises'
 import {constants} from 'node:fs'
 import {homedir} from 'node:os'
 import path from 'node:path'
 import {
+  cacheTransportUnavailable,
+  comparisonExportResult,
+  prepareComparisonPath,
+  requireComparisonFile,
+  validateComparisonMode
+} from './comparison.js'
+import {prepareObjectCachePath, requireObjectCachePathVector} from './cache-paths.js'
+import {
+  preinstalledInputs,
+  verifyPreinstalledMbx,
+  verifyPreinstalledMbxFile,
+  verifiedPreinstalledMbx
+} from './preinstalled.js'
+import {
   aliasedInput,
   type BundleForm,
   cacheLinksValue,
-  cacheRevision,
   canReuseCachedMbx,
   callingCard,
   type CallingCardRow,
@@ -31,15 +44,12 @@ import {
   parseGithubCacheMode,
   parsedMbxVersion,
   primaryCacheKey,
-  pullRequestRestoreKey,
-  type PullRequestRepositories,
   remoteExports,
   remoteStatus,
   type RemoteStatus,
   requireGithubCacheRuntime,
   releaseTarget,
   rustcIdentityArgs,
-  isSameRepositoryPullRequest,
   savePolicy,
   supportsDirectoryBundle,
   toolchainSegment,
@@ -55,6 +65,7 @@ import {
   pathsFromObjectsCacheRoot,
   reportObjectsResourcePhase,
   saveIsolatedObjectsBundle,
+  removeObjectsBundle,
   withIsolatedObjectsPostCleanup,
   type ObjectsCachePaths
 } from './objects-cache.js'
@@ -67,6 +78,7 @@ import {
 
 const POST_STATE = 'mbx-post'
 const CACHE_KEY_STATE = 'mbx-cache-key'
+const CACHE_RESTORED_KEY_STATE = 'mbx-cache-restored-key'
 const CACHE_HIT_STATE = 'mbx-cache-hit'
 const CACHE_ARCHIVE_STATE = 'mbx-cache-archive'
 const CACHE_EXPORT_GROUP_STATE = 'mbx-cache-export-group'
@@ -75,6 +87,11 @@ const CACHE_BUNDLE_FORM_STATE = 'mbx-cache-bundle-form'
 const CACHE_ISOLATION_ROOT_STATE = 'mbx-cache-isolation-root'
 const CARGO_WORKSPACE_STATE = 'mbx-cargo-workspace'
 const MBX_STATE = 'mbx-bin'
+const MBX_SELECTED_BIN_STATE = 'mbx-selected-bin'
+const MBX_EXPECTED_STATE = 'mbx-expected-version'
+const MBX_DIGEST_STATE = 'mbx-executable-sha256'
+const COMPARISON_STATE = 'mbx-comparison-state'
+const COMPARISON_DIGEST_STATE = 'mbx-comparison-sha256'
 const CACHE_ARCHIVE_NAME = 'github-actions-cache-v1.tar'
 // A directory rather than a tar. `actions/cache` archives whatever path it is
 // given, so a tar inside its archive means every byte is written twice on
@@ -85,6 +102,12 @@ const TARGET_TOOL_DIRECTORY = 'mbx-target-tool'
 interface MbxInstallation {
   bin: string
   version: string
+}
+
+class ComparisonImportFailure extends Error {
+  constructor(readonly exitCode: number) {
+    super(`mbx cache import exited with code ${exitCode}`)
+  }
 }
 
 async function leaveCallingCard(note: string, rows: CallingCardRow[]): Promise<void> {
@@ -102,13 +125,21 @@ async function leaveCallingCard(note: string, rows: CallingCardRow[]): Promise<v
 
 async function capture(command: string, args: string[], cwd?: string): Promise<string> {
   let output = ''
-  const exitCode = await exec.exec(command, args, {
-    cwd,
-    silent: true,
-    listeners: {stdout: data => (output += data.toString())}
-  })
-  if (exitCode !== 0) throw new Error(`${command} exited with code ${exitCode}`)
-  return output.trim()
+  const selectedBin = core.getState(MBX_SELECTED_BIN_STATE)
+  const expectedDigest = core.getState(MBX_DIGEST_STATE)
+  const verifySelected = Boolean(selectedBin && command === selectedBin && expectedDigest)
+  if (verifySelected) await verifyPreinstalledMbxFile(command, expectedDigest)
+  try {
+    const exitCode = await exec.exec(command, args, {
+      cwd,
+      silent: true,
+      listeners: {stdout: data => (output += data.toString())}
+    })
+    if (exitCode !== 0) throw new Error(`${command} exited with code ${exitCode}`)
+    return output.trim()
+  } finally {
+    if (verifySelected) await verifyPreinstalledMbxFile(command, expectedDigest)
+  }
 }
 
 async function isDirectory(directory: string): Promise<boolean> {
@@ -117,6 +148,83 @@ async function isDirectory(directory: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+function isPathWithin(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child)
+  return relative === '' ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+}
+
+async function assertComparisonOutsidePayload(
+  comparisonFile: string,
+  payloadPath: string,
+  payloadForm: BundleForm,
+  isolatedRoot?: string
+): Promise<void> {
+  const canonicalFile = path.join(await realpath(path.dirname(comparisonFile)), path.basename(comparisonFile))
+  const absolutePayload = path.resolve(payloadPath)
+  if (
+    canonicalFile === absolutePayload ||
+    (payloadForm === 'directory' && isPathWithin(absolutePayload, canonicalFile)) ||
+    (isolatedRoot && isPathWithin(path.resolve(isolatedRoot), canonicalFile))
+  ) {
+    throw new Error('comparison-state must be outside the transported cache bundle and isolated store')
+  }
+}
+
+async function requireEmptyComparisonState(mbx: string, file: string): Promise<void> {
+  const report = JSON.parse(
+    await capture(mbx, ['cache', 'comparison-state', file, '--json'])
+  ) as {version?: number; empty?: boolean}
+  if (report.version !== 1 || report.empty !== true) {
+    throw new Error('Invalid cold comparison baseline report')
+  }
+}
+
+async function verifyComparisonState(file: string, expectedDigest: string, mbx: string): Promise<void> {
+  await requireComparisonFile(file)
+  const digest = createHash('sha256').update(await readFile(file)).digest('hex')
+  if (!/^[0-9a-f]{64}$/.test(expectedDigest) || expectedDigest !== digest) {
+    throw new Error('Owner comparison baseline changed before post')
+  }
+  const verification = JSON.parse(
+    await capture(mbx, ['cache', 'comparison-state', file, '--verify', '--json'])
+  ) as {version?: number; valid?: boolean}
+  if (verification.version !== 1 || verification.valid !== true) {
+    throw new Error('Invalid mbx owner comparison baseline verification report')
+  }
+}
+
+async function verifyPreinstalledMbxAtPost(mbx: string): Promise<void> {
+  const expectedVersion = core.getState(MBX_EXPECTED_STATE)
+  if (!expectedVersion) return
+  const expectedDigest = core.getState(MBX_DIGEST_STATE)
+  if (
+    !/^[0-9a-f]{64}$/.test(expectedDigest) ||
+    expectedDigest !== core.getInput('expected-binary-sha256')
+  ) {
+    throw new Error('Verified preinstalled mbx executable changed before post')
+  }
+  try {
+    await verifyPreinstalledMbx(mbx, expectedVersion, expectedDigest, capture)
+  } catch (error) {
+    throw new Error(`Verified preinstalled mbx executable changed before post: ${String(error)}`)
+  }
+}
+
+async function removeFailedComparisonBundle(
+  paths: string[],
+  bundleForm: BundleForm,
+  isolatedPaths?: ObjectsCachePaths
+): Promise<void> {
+  if (isolatedPaths) {
+    await removeObjectsBundle(isolatedPaths)
+    return
+  }
+  const bundleName = bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME
+  const archive = await requireObjectCachePathVector(paths, bundleName, bundleForm)
+  await rm(archive, {recursive: true, force: true})
 }
 
 /**
@@ -328,6 +436,31 @@ async function configureRemote(mbx: string): Promise<RemoteStatus> {
 }
 
 async function main(): Promise<void> {
+  const externalBin = core.getInput('mbx-path')
+  const expectedVersion = core.getInput('expected-version')
+  const expectedBinaryDigest = core.getInput('expected-binary-sha256')
+  const requestedVersion = core.getInput('version')
+  const preinstalled = preinstalledInputs(
+    externalBin,
+    expectedVersion,
+    requestedVersion,
+    expectedBinaryDigest
+  )
+  const external = preinstalled
+    ? await verifiedPreinstalledMbx(
+        externalBin,
+        expectedVersion,
+        expectedBinaryDigest,
+        capture,
+        process.env.RUNNER_TEMP || ''
+      )
+    : undefined
+  if (external) {
+    core.addPath(path.dirname(external.bin))
+    core.saveState(MBX_SELECTED_BIN_STATE, external.bin)
+    core.saveState(MBX_EXPECTED_STATE, expectedVersion)
+    core.saveState(MBX_DIGEST_STATE, expectedBinaryDigest)
+  }
   const backend = parseBackend(core.getInput('backend'))
   const githubCacheMode = parseGithubCacheMode(core.getInput('github-cache-mode'))
   const isolateObjectsCache = core.getBooleanInput('isolate-objects-cache')
@@ -335,6 +468,23 @@ async function main(): Promise<void> {
     throw new Error('isolate-objects-cache requires backend github and github-cache-mode objects')
   }
   const targetCache = backend === 'github' && githubCacheMode === 'target'
+  const comparisonFile = core.getInput('comparison-state')
+  const requestedCacheKey = core.getInput('cache-key')
+  const explicitRestoreKeys = core.getMultilineInput('restore-keys').filter(Boolean)
+  validateComparisonMode(
+    comparisonFile,
+    preinstalled,
+    backend,
+    githubCacheMode,
+    requestedCacheKey,
+    explicitRestoreKeys,
+    core.getInput('cache-key-suffix')
+  )
+  if (comparisonFile) {
+    await prepareComparisonPath(comparisonFile, process.env.RUNNER_TEMP || '')
+    core.saveState(COMPARISON_STATE, comparisonFile)
+    if (!external) throw new Error('comparison-state requires a verified executable')
+  }
   if (backend === 'github') requireGithubCacheRuntime()
   const gcAuto = githubObjectGcDefault(backend, githubCacheMode)
   if (gcAuto !== undefined) {
@@ -343,7 +493,7 @@ async function main(): Promise<void> {
   }
   const githubToken = githubTokenValue(core.getInput('github-token'))
   if (githubToken) core.setSecret(githubToken)
-  let installed = targetCache ? undefined : await setupMbx(core.getInput('version'), githubToken)
+  let installed = external ?? (targetCache ? undefined : await setupMbx(requestedVersion, githubToken))
   const cacheLinks =
     targetCache
       ? '0'
@@ -401,11 +551,20 @@ async function main(): Promise<void> {
       cacheArchive = isolatedObjectsPaths.bundle
     } else {
       const cacheDir = await capture(installed.bin, ['cache', 'dir'])
-      await mkdir(cacheDir, {recursive: true})
-      cacheArchive = path.join(
+      cacheArchive = await prepareObjectCachePath(
         cacheDir,
-        bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME
+        bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME,
+        bundleForm
       )
+    }
+  }
+  if (comparisonFile) {
+    if (!installed) throw new Error('comparison-state requires a verified executable')
+    const baseline = JSON.parse(
+      await capture(installed.bin, ['cache', 'comparison-state', comparisonFile, '--json'])
+    ) as {version?: number; empty?: boolean}
+    if (baseline.version !== 1 || baseline.empty !== true) {
+      throw new Error('mbx does not support the required empty comparison-state API')
     }
   }
   const exportGroup =
@@ -449,32 +608,20 @@ async function main(): Promise<void> {
       ref: context.ref,
       defaultBranch,
       refProtected: process.env.GITHUB_REF_PROTECTED === 'true',
-      cacheMode: process.env.ACTIONS_CACHE_MODE,
-      sameRepository: isSameRepositoryPullRequest(
-        context.payload.pull_request as PullRequestRepositories | undefined
-      )
-    },
-    {
-      workflowDispatch: core.getBooleanInput('save-on-workflow-dispatch'),
-      pullRequest: core.getBooleanInput('save-on-pull-request'),
-      protectedBranch: core.getBooleanInput('save-on-protected-branch')
+      cacheMode: process.env.ACTIONS_CACHE_MODE
     }
   )
   const baseSha = context.payload.pull_request?.base.sha ?? context.sha
-  const sha = cacheRevision(context.eventName, baseSha, save, context.runId, context.runAttempt)
-  const primaryKey = primaryCacheKey(
-    core.getInput('cache-key'),
-    core.getInput('cache-key-suffix'),
-    generatedKey(process.platform, process.arch, generation, toolchain, sha)
-  )
-  const explicitRestoreKeys = core.getMultilineInput('restore-keys').filter(Boolean)
+  const sha = baseSha
+  const primaryKey = comparisonFile
+    ? requestedCacheKey
+    : primaryCacheKey(
+        requestedCacheKey,
+        core.getInput('cache-key-suffix'),
+        generatedKey(process.platform, process.arch, generation, toolchain, sha)
+      )
   const generatedRestoreKeys: string[] = []
   if (explicitRestoreKeys.length === 0) {
-    if (save && context.eventName === 'pull_request') {
-      generatedRestoreKeys.push(
-        pullRequestRestoreKey(process.platform, process.arch, generation, toolchain, baseSha)
-      )
-    }
     generatedRestoreKeys.push(
       generatedRestoreKey(process.platform, process.arch, generation, toolchain)
     )
@@ -494,9 +641,19 @@ async function main(): Promise<void> {
     targetDirectory,
     path.join(cargoHome, 'registry'),
     path.join(cargoHome, 'git'),
-    targetToolDirectory
+    ...(preinstalled ? [] : [targetToolDirectory])
   ]
   const cachePaths = githubCacheMode === 'target' ? targetPaths : [cacheArchive]
+  if (comparisonFile) {
+    const payloadPath = cachePaths[0]
+    if (!payloadPath) throw new Error('comparison-state cache payload has no path')
+    await assertComparisonOutsidePayload(
+      comparisonFile,
+      payloadPath,
+      bundleForm,
+      isolatedObjectsPaths?.root
+    )
+  }
   if (isolatedObjectsPaths) {
     core.saveState(CACHE_ISOLATION_ROOT_STATE, isolatedObjectsPaths.root)
     await reportObjectsResourcePhase(
@@ -506,10 +663,20 @@ async function main(): Promise<void> {
       message => core.info(message)
     )
   }
-  const restoredKey = await cache.restoreCache(cachePaths, primaryKey, restoreKeys)
-  if (targetCache) {
+  let restoredKey: string | undefined
+  let receivedKey: string | undefined
+  let restoreUnavailable = false
+  try {
+    restoredKey = await cache.restoreCache(cachePaths, primaryKey, restoreKeys)
+    receivedKey = restoredKey
+  } catch (error) {
+    if (!comparisonFile || !cacheTransportUnavailable(error)) throw error
+    core.warning(`Optional mbx cache restore unavailable: ${String(error)}`)
+    restoreUnavailable = true
+  }
+  if (targetCache && !preinstalled) {
     installed = await stageTargetCacheMbx(
-      await setupMbx(core.getInput('version'), githubToken, targetToolDirectory),
+      await setupMbx(requestedVersion, githubToken, targetToolDirectory),
       targetToolDirectory
     )
   }
@@ -518,25 +685,70 @@ async function main(): Promise<void> {
   core.setOutput('mbx-version', installed.version)
   core.saveState(POST_STATE, backend)
   core.saveState(MBX_STATE, installed.bin)
+  if (restoreUnavailable && comparisonFile) {
+    await removeFailedComparisonBundle(cachePaths, bundleForm, isolatedObjectsPaths)
+  }
+  if (comparisonFile) {
+    await verifyPreinstalledMbx(installed.bin, expectedVersion, expectedBinaryDigest, capture)
+  }
   if (restoredKey && githubCacheMode === 'objects') {
-    if (isolatedObjectsPaths) {
-      await importObjectsBundle(isolatedObjectsPaths, async bundlePath => {
-        await reportObjectsResourcePhase(
-          isolatedObjectsPaths!,
-          'before-cache-import',
-          targetDirectory,
-          message => core.info(message)
+    try {
+      if (isolatedObjectsPaths) {
+        await importObjectsBundle(isolatedObjectsPaths, async bundlePath => {
+          await reportObjectsResourcePhase(
+            isolatedObjectsPaths!,
+            'before-cache-import',
+            targetDirectory,
+            message => core.info(message)
+          )
+          const args = comparisonFile
+            ? ['cache', 'import', '--comparison-state', comparisonFile, '--json', bundlePath]
+            : ['cache', 'import', bundlePath]
+          if (comparisonFile) {
+            const code = await exec.exec(installed!.bin, args, {ignoreReturnCode: true})
+            if (code !== 0) throw new ComparisonImportFailure(code)
+          } else {
+            await exec.exec(installed!.bin, args)
+          }
+        })
+      } else {
+        await requireObjectCachePathVector(
+          cachePaths,
+          bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME,
+          bundleForm,
+          true
         )
-        await exec.exec(installed!.bin, ['cache', 'import', bundlePath])
-      })
-    } else {
-      await exec.exec(installed.bin, ['cache', 'import', cacheArchive])
+        const args = comparisonFile
+          ? ['cache', 'import', '--comparison-state', comparisonFile, '--json', cacheArchive]
+          : ['cache', 'import', cacheArchive]
+        if (comparisonFile) {
+          const code = await exec.exec(installed.bin, args, {ignoreReturnCode: true})
+          if (code !== 0) throw new ComparisonImportFailure(code)
+        } else {
+          await exec.exec(installed.bin, args)
+        }
+      }
+    } catch (error) {
+      if (!comparisonFile || !(error instanceof ComparisonImportFailure)) throw error
+      core.warning(
+        `Optional mbx cache import failed (${error.exitCode}); continuing with a cold comparison baseline`
+      )
+      await removeFailedComparisonBundle(cachePaths, bundleForm, isolatedObjectsPaths)
+      restoredKey = undefined
+      await requireEmptyComparisonState(installed.bin, comparisonFile)
     }
   } else if (isolatedObjectsPaths) {
     await assertObjectsBundleAbsent(isolatedObjectsPaths)
   } else if (restoredKey && githubCacheMode === 'target') {
     const hydrated = await hydrateMbxShimBinaries(targetDirectory, installed.bin)
     if (hydrated > 0) core.info(`Restored ${hydrated} mbx build-script shim binaries`)
+  }
+  if (comparisonFile) {
+    await requireComparisonFile(comparisonFile)
+    core.saveState(
+      COMPARISON_DIGEST_STATE,
+      createHash('sha256').update(await readFile(comparisonFile)).digest('hex')
+    )
   }
   const hit = restoredKey === primaryKey
   core.setOutput('cache-hit', hit ? 'true' : 'false')
@@ -550,6 +762,7 @@ async function main(): Promise<void> {
   core.saveState(CACHE_PATHS_STATE, JSON.stringify(cachePaths))
   core.saveState(CARGO_WORKSPACE_STATE, cargoWorkspace)
   core.saveState(CACHE_KEY_STATE, primaryKey)
+  core.saveState(CACHE_RESTORED_KEY_STATE, receivedKey || '')
   core.saveState(CACHE_HIT_STATE, hit ? 'true' : 'false')
   core.saveState(
     POST_STATE,
@@ -590,8 +803,60 @@ async function main(): Promise<void> {
   ])
 }
 
+async function exportObjectsBundle(
+  mbx: string,
+  group: string,
+  bundleForm: BundleForm,
+  bundlePath: string,
+  comparisonFile: string,
+  isolatedPaths?: ObjectsCachePaths
+): Promise<{exitCode: number; output: string}> {
+  if (comparisonFile) {
+    await verifyComparisonState(
+      comparisonFile,
+      core.getState(COMPARISON_DIGEST_STATE),
+      mbx
+    )
+  }
+  await verifyPreinstalledMbxAtPost(mbx)
+  if (isolatedPaths) {
+    const resolvedActionStore = await capture(mbx, ['cache', 'dir'])
+    assertIsolatedObjectsActionStore(isolatedPaths, resolvedActionStore)
+  } else {
+    const paths = JSON.parse(core.getState(CACHE_PATHS_STATE)) as string[]
+    await requireObjectCachePathVector(
+      paths,
+      bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME,
+      bundleForm
+    )
+  }
+  const args =
+    bundleForm === 'directory'
+      ? ['cache', 'export', '--group', group, '--format', 'directory', bundlePath]
+      : ['cache', 'export', '--group', group, bundlePath]
+  if (comparisonFile) args.splice(2, 0, '--compare', comparisonFile, '--json')
+  let output = ''
+  const exitCode = await exec.exec(mbx, args, {
+    ignoreReturnCode: true,
+    listeners: {
+      stdout: data => (output += data.toString()),
+      stderr: data => (output += data.toString())
+    }
+  })
+  if (comparisonFile) {
+    await verifyComparisonState(
+      comparisonFile,
+      core.getState(COMPARISON_DIGEST_STATE),
+      mbx
+    )
+    await verifyPreinstalledMbxAtPost(mbx)
+  }
+  return {exitCode, output}
+}
+
 async function post(): Promise<void> {
   const postState = core.getState(POST_STATE)
+  const comparisonFile = core.getState(COMPARISON_STATE)
   const isolationRoot = core.getState(CACHE_ISOLATION_ROOT_STATE)
   if (isolationRoot && (postState === 'github-save' || postState === 'github-restore-only')) {
     const savedForm = core.getState(CACHE_BUNDLE_FORM_STATE)
@@ -612,35 +877,43 @@ async function post(): Promise<void> {
         if (!primaryKey) throw new Error('isolated objects cache is missing its primary key')
         const cargoWorkspace = core.getState(CARGO_WORKSPACE_STATE) || process.cwd()
         const targetDirectory = path.join(cargoWorkspace, 'target')
+        const exportReport = comparisonFile
+          ? (output: string) => {
+              const report = comparisonExportResult(output.trim())
+              core.info(
+                `MBX export workspace usefulness ${report.workspaceUsefulness.status} ` +
+                  `(${report.workspaceUsefulness.reason}); workspace persistence verified: ` +
+                  `${report.workspacePersistenceVerified}`
+              )
+              return {useful: report.useful, cacheKey: `${primaryKey}-${report.digest}`}
+            }
+          : undefined
         return saveIsolatedObjectsBundle({
           paths: isolatedPaths,
           primaryKey,
           saveEligible: postState === 'github-save',
           exactHit: core.getState(CACHE_HIT_STATE) === 'true',
           cargoTarget: targetDirectory,
-          exportBundle: async bundlePath => {
+          exportBundle: bundlePath => {
             const mbx = core.getState(MBX_STATE)
             if (!mbx) throw new Error('isolated objects cache is missing its mbx executable')
-            const resolvedActionStore = await capture(mbx, ['cache', 'dir'])
-            assertIsolatedObjectsActionStore(isolatedPaths, resolvedActionStore)
             const group = core.getState(CACHE_EXPORT_GROUP_STATE)
             if (!group) throw new Error('isolated objects cache is missing its export group')
-            const exportArgs =
-              form === 'directory'
-                ? ['cache', 'export', '--group', group, '--format', 'directory', bundlePath]
-                : ['cache', 'export', '--group', group, bundlePath]
-            let output = ''
-            const exitCode = await exec.exec(mbx, exportArgs, {
-              ignoreReturnCode: true,
-              listeners: {
-                stdout: data => (output += data.toString()),
-                stderr: data => (output += data.toString())
-              }
-            })
-            return {exitCode, output}
+            return exportObjectsBundle(mbx, group, form, bundlePath, comparisonFile, isolatedPaths)
           },
           isEmptyExport,
-          saveCache: (paths, key) => cache.saveCache(paths, key),
+          exportReport,
+          restoredKey: core.getState(CACHE_RESTORED_KEY_STATE),
+          optionalUpload: Boolean(comparisonFile),
+          saveCache: async (paths, key) => {
+            try {
+              return await cache.saveCache(paths, key)
+            } catch (error) {
+              if (!comparisonFile) throw error
+              core.warning(`Optional mbx objects cache upload unavailable: ${String(error)}`)
+              return -1
+            }
+          },
           emit: message => core.info(message),
           warn: message => core.warning(message)
         })
@@ -654,14 +927,14 @@ async function post(): Promise<void> {
   }
   if (postState !== 'github-save') return
   const primaryKey = core.getState(CACHE_KEY_STATE)
-  if (core.getState(CACHE_HIT_STATE) === 'true') {
+  if (core.getState(CACHE_HIT_STATE) === 'true' && !comparisonFile) {
     core.info(`Exact cache ${primaryKey} already exists; not saving it again`)
     return
   }
   const mbx = core.getState(MBX_STATE)
-  const archive = core.getState(CACHE_ARCHIVE_STATE)
   const group = core.getState(CACHE_EXPORT_GROUP_STATE)
   const paths = JSON.parse(core.getState(CACHE_PATHS_STATE)) as string[]
+  await verifyPreinstalledMbxAtPost(mbx)
   if (!group) {
     const cargoWorkspace = core.getState(CARGO_WORKSPACE_STATE) || process.cwd()
     const targetDirectory = path.join(cargoWorkspace, 'target')
@@ -679,27 +952,61 @@ async function post(): Promise<void> {
     return
   }
   const bundleForm = (core.getState(CACHE_BUNDLE_FORM_STATE) || 'tar') as BundleForm
-  const exportArgs =
-    bundleForm === 'directory'
-      ? ['cache', 'export', '--group', group, '--format', 'directory', archive]
-      : ['cache', 'export', '--group', group, archive]
-  let output = ''
-  const exportExitCode = await exec.exec(mbx, exportArgs, {
-    ignoreReturnCode: true,
-    listeners: {
-      stdout: data => (output += data.toString()),
-      stderr: data => (output += data.toString())
-    }
-  })
-  if (exportExitCode !== 0) {
-    if (isEmptyExport(output)) {
+  const archive = core.getState(CACHE_ARCHIVE_STATE)
+  const exported = await exportObjectsBundle(mbx, group, bundleForm, archive, comparisonFile)
+  if (exported.exitCode !== 0) {
+    if (isEmptyExport(exported.output)) {
       core.info('No completed mbx build was recorded; not saving an empty cache')
       return
     }
-    throw new Error(`mbx cache export exited with code ${exportExitCode}`)
+    if (comparisonFile) {
+      core.warning(`Optional mbx cache export exited with code ${exported.exitCode}; skipping cache save`)
+      return
+    }
+    throw new Error(`mbx cache export exited with code ${exported.exitCode}`)
   }
-  const cacheId = await cache.saveCache([archive], primaryKey)
-  core.info(`Saved mbx cache ${primaryKey} (ID ${cacheId})`)
+  const report = comparisonFile ? comparisonExportResult(exported.output.trim()) : undefined
+  if (report) {
+    core.info(
+      `MBX export workspace usefulness ${report.workspaceUsefulness.status} ` +
+        `(${report.workspaceUsefulness.reason}); workspace persistence verified: ` +
+        `${report.workspacePersistenceVerified}`
+    )
+    if (!report.useful) {
+      core.info('No exported useful mbx owner-state bundle; skipping cache save')
+      return
+    }
+  }
+  await requireObjectCachePathVector(
+    paths,
+    bundleForm === 'directory' ? CACHE_BUNDLE_NAME : CACHE_ARCHIVE_NAME,
+    bundleForm,
+    true
+  )
+  const saveKey = report ? `${primaryKey}-${report.digest}` : primaryKey
+  if (report && core.getState(CACHE_RESTORED_KEY_STATE) === saveKey) {
+    core.info(`The restored semantic snapshot ${saveKey} is unchanged; skipping duplicate cache save`)
+    return
+  }
+  if (comparisonFile) {
+    await saveOptionalCache(paths, saveKey, 'objects')
+  } else {
+    const cacheId = await cache.saveCache([archive], saveKey)
+    core.info(`Saved mbx cache ${saveKey} (ID ${cacheId})`)
+  }
+}
+
+async function saveOptionalCache(paths: string[], key: string, payload: string): Promise<void> {
+  try {
+    const cacheId = await cache.saveCache(paths, key)
+    if (cacheId < 0) {
+      core.info(`Optional mbx ${payload} cache was not saved`)
+      return
+    }
+    core.info(`Saved mbx ${payload} cache ${key} (ID ${cacheId})`)
+  } catch (error) {
+    core.warning(`Optional mbx ${payload} cache upload unavailable: ${String(error)}`)
+  }
 }
 
 const isPost = Boolean(core.getState(POST_STATE))
