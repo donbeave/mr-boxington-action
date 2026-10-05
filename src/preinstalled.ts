@@ -142,20 +142,3 @@ async function removePrivateDirectory(directory: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
 }
-
-export async function compilerIdentity(
-  toolchain: string,
-  args: string[],
-  capture: Capture
-): Promise<string | null> {
-  try {
-    const identity = await capture('rustc', args)
-    if (!identity.trim()) throw new Error('rustc returned an empty identity')
-    return identity
-  } catch (error) {
-    if (toolchain.trim()) {
-      throw new Error(`Could not probe named Rust toolchain ${JSON.stringify(toolchain)}: ${String(error)}`)
-    }
-    return null
-  }
-}

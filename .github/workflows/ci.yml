@@ -21,6 +21,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      # Native import and transport-boundary tests use a mocked MBX process.
+      # They check the action contract; live discovery, producer provenance,
+      # and hosted artifact transport remain separate qualification gates.
       - run: npm test
       - run: npm run build
       - run: git diff --exit-code -- dist
@@ -35,141 +38,64 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # The objects payload keeps its own lifecycle (import before the build,
-      # export the closure after), so this job pins it explicitly and the
-      # `target` job below covers the default.
       - id: mbx
         uses: ./
+        env:
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
         with:
-          github-cache-mode: objects
+          backend: local
+          snapshot-read-token: ''
       - run: mbx --version
       - run: mbx cache dir
-      # The toolchain segment is what keeps one toolchain's store off another's
-      # key, so assert the generated key actually carries one on every runner.
-      # The generation ahead of it is not a single segment: a directory bundle
-      # adds its own so it cannot share a key space with a tar one.
-      - name: Check the cache key is scoped by toolchain
+      - name: Check local setup output and native cold state
         env:
-          PRIMARY_KEY: ${{ steps.mbx.outputs.cache-primary-key }}
-        # A block scalar, because a plain one cannot hold the `: ` this
-        # command's failure message would otherwise put in it.
+          IMPORTED: ${{ steps.mbx.outputs.native-snapshot-imported }}
+          COMPARISON_STATE: ${{ steps.mbx.outputs.native-snapshot-comparison-state }}
+          MBX_VERSION: ${{ steps.mbx.outputs.mbx-version }}
         run: |
-          node -e "const k = process.env.PRIMARY_KEY; if (!/-mbx-.+-(rust-[0-9a-f]{12}|norust)-/.test(k)) { console.error('cache key is not scoped by toolchain: ' + k); process.exit(1) }"
-      # This workflow runs on pushes to main and on pull requests, and opts
-      # neither into anything else, so only the push may save.
-      - name: Check the save policy is reported
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SAVE_ELIGIBLE: ${{ steps.mbx.outputs.cache-save-eligible }}
-          SAVE_REASON: ${{ steps.mbx.outputs.cache-save-reason }}
-        run: |
-          node -e "const expected = process.env.EVENT_NAME === 'push' ? 'true' : 'false'; if (process.env.SAVE_ELIGIBLE !== expected || !process.env.SAVE_REASON) { console.error('unexpected save policy: ' + process.env.SAVE_ELIGIBLE + ' (' + process.env.SAVE_REASON + ')'); process.exit(1) }"
+          node -e "if (process.env.IMPORTED !== 'false' || process.env.COMPARISON_STATE !== '' || !process.env.MBX_VERSION) { console.error('unexpected local setup outputs'); process.exit(1) }"
       - name: Check native link cache policy
         run: node -e "if ((process.platform === 'linux') !== (process.env.MBX_CACHE_LINKS === '1')) process.exit(1)"
-      - name: Check imported objects survive automatic GC
-        run: node -e "if (process.env.MBX_GC_AUTO !== '0') { console.error('object mode must disable automatic GC on GitHub-hosted runners'); process.exit(1) }"
-      # Exercise the same CLI lifecycle used by the action's restore and post
-      # phases. Node keeps the harness identical on bash, macOS, and PowerShell.
-      - name: Round-trip a real build closure
-        run: node .github/e2e/cache-bundle.mjs
-
-  target:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - id: mbx
-        uses: ./
-        with:
-          # Its own generation, so a smoke test never saves over a key a real
-          # build would restore.
-          cache-generation: target-default-ci
-          # The fixture workspace sits below the checkout root, so the payload
-          # must follow it rather than the root's (absent) target directory.
-          working-directory: .github/e2e/fixture
-      - run: mbx --version
-      - name: Check the default payload is the target tree
-        env:
-          PRIMARY_KEY: ${{ steps.mbx.outputs.cache-primary-key }}
-        run: |
-          node -e "const k = process.env.PRIMARY_KEY; if (!/-mbx-target-default-ci-target-/.test(k)) { console.error('default cache key is not scoped to the target payload: ' + k); process.exit(1) }"
-          node -e "if (process.env.MBX_TARGET_VIEWS !== '0' || process.env.MBX_CACHE_LINKS !== '0') { console.error('target mode must keep Cargo in place and skip link objects'); process.exit(1) }"
-      - name: Build into the in-place target
+      - name: Build fixture through the selected MBX
         run: mbx build --locked --manifest-path .github/e2e/fixture/Cargo.toml
-      - name: Check Cargo state stayed in place
-        run: node -e "const fs = require('fs'); if (!fs.existsSync('.github/e2e/fixture/target/debug/.fingerprint')) { console.error('no fingerprint tree in the workspace target'); process.exit(1) }"
-
-  toolchain:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      # Nightly rather than a pinned release: what needs proving is that the key
-      # follows the named toolchain instead of the default one, which takes a
-      # toolchain whose identity the runner image's default can never happen to
-      # share.
-      - run: rustup toolchain install nightly --profile minimal
-      - id: mbx
-        uses: ./
-        with:
-          toolchain: nightly
-          # Its own generation, so a smoke test that builds nothing never saves
-          # over a key a real build would restore.
-          cache-generation: toolchain-input-ci
-      - name: Check the cache key follows the named toolchain
-        env:
-          PRIMARY_KEY: ${{ steps.mbx.outputs.cache-primary-key }}
-        # A block scalar, because a plain one cannot hold the `: ` these failure
-        # messages put in themselves.
-        run: |
-          node -e "
-          const {createHash} = require('node:crypto');
-          const {execFileSync} = require('node:child_process');
-          const segment = (args) => 'rust-' + createHash('sha256')
-            .update(execFileSync('rustc', args, {encoding: 'utf8'}).trim())
-            .digest('hex').slice(0, 12);
-          const named = segment(['+nightly', '-vV']);
-          const preinstalled = segment(['-vV']);
-          if (named === preinstalled) {
-            console.error('nightly and the default toolchain report one identity, so this proves nothing');
-            process.exit(1);
-          }
-          const key = process.env.PRIMARY_KEY;
-          if (!key.includes(named)) {
-            console.error('cache key does not follow the named toolchain: ' + key);
-            process.exit(1);
-          }
-          "
-
-  server:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      # `server` and its input names predate `remote` and must keep working.
-      # The host never resolves, so mbx's connection check fails and the
-      # action only warns: the configuration itself is one mbx accepts.
-      - uses: ./
-        with:
-          backend: server
-          server-url: https://cache.example.com
-          namespace: action/smoke-test
-          token: smoke-test-token
-      - name: Check exported configuration
-        run: |
-          test "$MBX_REMOTE_URL" = https://cache.example.com
-          test "$MBX_REMOTE_NAMESPACE" = action/smoke-test
-          test "$MBX_REMOTE_TOKEN" = smoke-test-token
-          # No mode input, so none is exported and mbx applies its default.
-          test -z "${MBX_REMOTE_MODE+set}"
-          mbx --version
+      - name: Check workspace target was produced
+        run: node -e "const fs = require('node:fs'); if (!fs.existsSync('.github/e2e/fixture/target/debug/.fingerprint')) { console.error('no fingerprint tree in the fixture workspace target'); process.exit(1) }"
 
   remote:
     runs-on: ubuntu-latest
@@ -177,60 +103,295 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # Stands in for a runner action that points mbx at its own bucket. The
-      # endpoint is a closed loopback port, so the probe fails at once without
-      # sending these placeholder credentials anywhere.
-      - name: Configure a remote in an earlier step
-        run: |
-          {
-            echo MBX_REMOTE_URL=s3://smoke-test/cache/mbx
-            echo MBX_REMOTE_NAMESPACE=from-environment
-            echo MBX_REMOTE_MODE=read-only
-            echo MBX_REMOTE_S3_ENDPOINT=http://127.0.0.1:9
-            echo MBX_HTTP_RETRIES=0
-            echo AWS_ACCESS_KEY_ID=placeholder
-            echo AWS_SECRET_ACCESS_KEY=placeholder
-            echo AWS_REGION=us-east-1
-          } >> "$GITHUB_ENV"
-      # An input still wins over the environment for the setting it names.
-      - uses: ./
+      # Configuration is exported for later build commands. No cache operation
+      # runs here, so the placeholder endpoint and credentials stay unused.
+      - id: mbx
+        uses: ./
+        env:
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
         with:
           backend: remote
-          namespace: from-input
-      - name: Check the earlier configuration survived
+          remote-url: https://cache.example.com
+          namespace: action/smoke-test
+          token: smoke-test-token
+          remote-mode: read-only
+          snapshot-read-token: ''
+      - name: Check exported remote configuration
         run: |
-          test "$MBX_REMOTE_URL" = s3://smoke-test/cache/mbx
-          test "$MBX_REMOTE_NAMESPACE" = from-input
-          test "$MBX_REMOTE_MODE" = read-only
-          test "$AWS_ACCESS_KEY_ID" = placeholder
-          test "$AWS_SECRET_ACCESS_KEY" = placeholder
+          node -e "const e=process.env; if(e.MBX_REMOTE_URL!=='https://cache.example.com'||e.MBX_REMOTE_NAMESPACE!=='action/smoke-test'||e.MBX_REMOTE_TOKEN!=='smoke-test-token'||e.MBX_REMOTE_MODE!=='read-only'){console.error('remote action inputs were not exported');process.exit(1)}"
           mbx --version
 
-  remote-missing:
+  remote-inherited:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # With no remote anywhere, the backend must fail rather than leave mbx
-      # quietly building against the local cache.
+      - name: Configure remote values in an earlier step
+        run: |
+          {
+            echo MBX_REMOTE_URL=s3://smoke-test/cache/mbx
+            echo MBX_REMOTE_NAMESPACE=from-environment
+            echo MBX_REMOTE_MODE=read-only
+            echo AWS_ACCESS_KEY_ID=placeholder
+            echo AWS_SECRET_ACCESS_KEY=placeholder
+          } >> "$GITHUB_ENV"
       - id: mbx
-        continue-on-error: true
         uses: ./
+        env:
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
         with:
           backend: remote
-      - name: Check the step failed
+          namespace: from-input
+          snapshot-read-token: ''
+      - name: Check earlier remote settings remain available
+        run: |
+          node -e "const e=process.env; if(e.MBX_REMOTE_URL!=='s3://smoke-test/cache/mbx'||e.MBX_REMOTE_NAMESPACE!=='from-input'||e.MBX_REMOTE_MODE!=='read-only'||e.AWS_ACCESS_KEY_ID!=='placeholder'||e.AWS_SECRET_ACCESS_KEY!=='placeholder'){console.error('inherited remote settings were not preserved');process.exit(1)}"
+          mbx --version
+
+  remote-empty:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Remote setup accepts settings supplied later or by MBX configuration;
+      # it does not require this setup step to invent remote credentials.
+      - id: mbx
+        uses: ./
         env:
-          OUTCOME: ${{ steps.mbx.outcome }}
-        run: test "$OUTCOME" = failure
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
+        with:
+          backend: remote
+          snapshot-read-token: ''
+      - run: mbx --version
+
+  native-requires-source-bound-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - id: native
+        continue-on-error: true
+        uses: ./
+        env:
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
+        with:
+          backend: local
+          snapshot-selection: latest-compatible
+          snapshot-read-token: ''
+      - name: Require the strict preinstalled binary tuple before native import
+        env:
+          OUTCOME: ${{ steps.native.outcome }}
+        run: |
+          node -e "if (process.env.OUTCOME !== 'failure') { console.error('native selection without a source-bound binary must fail'); process.exit(1) }"
+
+  legacy-backend-rejected:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - id: rejected
+        continue-on-error: true
+        uses: ./
+        env:
+          ALL_PROXY: ''
+          all_proxy: ''
+          FTP_PROXY: ''
+          ftp_proxy: ''
+          HTTP_PROXY: ''
+          http_proxy: ''
+          HTTPS_PROXY: ''
+          https_proxy: ''
+          NO_PROXY: ''
+          no_proxy: ''
+          GLOBAL_AGENT_HTTP_PROXY: ''
+          NPM_CONFIG_HTTPS_PROXY: ''
+          NPM_CONFIG_PROXY: ''
+          npm_config_https_proxy: ''
+          npm_config_proxy: ''
+          CURL_CA_BUNDLE: ''
+          REQUESTS_CA_BUNDLE: ''
+          SSL_CERT_FILE: ''
+          SSL_CERT_DIR: ''
+          NODE_TLS_REJECT_UNAUTHORIZED: ''
+          NODE_EXTRA_CA_CERTS: ''
+          NODE_USE_ENV_PROXY: ''
+          NODE_USE_SYSTEM_CA: ''
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          OPENSSL_CONF: ''
+          OPENSSL_MODULES: ''
+          SSLKEYLOGFILE: ''
+          LD_PRELOAD: ''
+          LD_LIBRARY_PATH: ''
+          LD_AUDIT: ''
+          LD_DEBUG: ''
+          DYLD_INSERT_LIBRARIES: ''
+          DYLD_LIBRARY_PATH: ''
+          BASH_ENV: ''
+          ENV: ''
+          TAR_OPTIONS: ''
+        with:
+          backend: server
+          snapshot-read-token: ''
+      - name: Check removed backend alias is rejected
+        env:
+          OUTCOME: ${{ steps.rejected.outcome }}
+        run: |
+          node -e "if (process.env.OUTCOME !== 'failure') { console.error('removed backend alias must fail'); process.exit(1) }"
 
   final:
     permissions: {}
-    needs: [action, remote, remote-missing, server, target, test, toolchain]
+    needs: [action, legacy-backend-rejected, native-requires-source-bound-binary, remote, remote-empty, remote-inherited, test]
     runs-on: ubuntu-latest
     timeout-minutes: 1
-    # Run on success or upstream failure but skip when the workflow is cancelled
-    # — `always()` would override cancellation and waste a runner.
     if: ${{ !cancelled() }}
     steps:
       - name: Check CI job results
