@@ -4,6 +4,12 @@ This action sets up the native `mbx` command for a local or remote cache. An
 optional native snapshot is imported only by a verified MBX binary. The action
 has no GitHub cache writer, cache restore key, or post step.
 
+Native snapshot support is reader-only: the action delegates import to MBX and
+reports whether the workspace was restored plus the private comparison-state
+path. It does not export or upload snapshots. Action CI tests the native import
+contract with a mocked MBX process; those tests do not qualify live artifact
+discovery, a producer profile, or hosted transport.
+
 ## Local cache
 
 ```yaml

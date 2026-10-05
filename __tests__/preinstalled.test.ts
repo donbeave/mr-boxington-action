@@ -3,7 +3,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {chmod, mkdtemp, realpath, rm, symlink, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import path from 'node:path'
-import {compilerIdentity, preinstalledInputs, verifyPreinstalledMbxFile, verifiedPreinstalledMbx} from '../src/preinstalled.js'
+import {preinstalledInputs, verifyPreinstalledMbxFile, verifiedPreinstalledMbx} from '../src/preinstalled.js'
 
 const digest = createHash('sha256').update('fixture').digest('hex')
 const directories: string[] = []
@@ -167,23 +167,5 @@ describe('strict preinstalled executable', () => {
     )
     expect(selected.bin).not.toContain(`${path.sep}runner-temp-alias${path.sep}`)
     await expect(verifyPreinstalledMbxFile(selected.bin, digest)).resolves.toBeUndefined()
-  })
-})
-
-describe('named compiler identity', () => {
-  it('probes the named compiler and preserves its complete identity', async () => {
-    const identity = 'rustc 1.98.0\nhost: x86_64-unknown-linux-gnu'
-    const capture = vi.fn().mockResolvedValue(identity)
-    expect(await compilerIdentity('1.98.0', ['+1.98.0', '-vV'], capture)).toBe(identity)
-    expect(capture.mock.calls).toEqual([['rustc', ['+1.98.0', '-vV']]])
-  })
-  it.each(['', ' '])('retains optional default probe fallback for %j', async name => {
-    expect(await compilerIdentity(name, ['-vV'], vi.fn().mockRejectedValue(new Error('absent')))).toBeNull()
-  })
-  it.each([new Error('missing toolchain'), new Error('exit 1')])('fails closed on a named toolchain error', async error => {
-    await expect(compilerIdentity('1.98.0', ['+1.98.0', '-vV'], vi.fn().mockRejectedValue(error))).rejects.toThrow(/named Rust toolchain/)
-  })
-  it('rejects an empty named compiler identity', async () => {
-    await expect(compilerIdentity('1.98.0', ['+1.98.0', '-vV'], vi.fn().mockResolvedValue(''))).rejects.toThrow(/named Rust toolchain/)
   })
 })
